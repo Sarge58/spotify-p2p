@@ -11,7 +11,8 @@
         iceServers: [
             { urls: 'stun:stun.l.google.com:19302' },
             { urls: 'stun:stun1.l.google.com:19302' }
-        ]
+        ],
+        iceCandidatePoolSize: 2
     };
     const DRIFT_THRESHOLD = 500;
     const HEARTBEAT_INTERVAL = 1000;
@@ -322,9 +323,9 @@
                 font-size: 14px; font-weight: 500; text-align: center;
                 padding: 16px; background: #1a1a1a; border: 1px solid #333;
                 border-radius: 8px; margin-bottom: 12px;
-                font-family: monospace; word-break: break-all;
-                line-height: 1.6; color: #e0e0e0; max-height: 120px;
-                overflow-y: auto; user-select: all; cursor: text;
+                font-family: monospace; white-space: nowrap;
+                line-height: 1.6; color: #e0e0e0;
+                overflow-x: auto; overflow-y: hidden; user-select: all; cursor: text;
             }
 
             .p2p-status { text-align: center; font-size: 13px; margin: 12px 0; }
@@ -603,6 +604,12 @@
         }, DISCONNECT_GRACE_PERIOD);
     }
 
+    function reportIceServerError(event) {
+        if (event.errorCode !== 701) return;
+        console.warn('SpotifyP2P: ICE server unreachable', event.url, event.errorText);
+        showToast('Your network cannot reach the connection helper server', 'error');
+    }
+
     function prepareGuestReconnect() {
         showSessionView();
         setGuestConnectionStatus('Disconnected — get a new code from the host', 'disconnected');
@@ -690,6 +697,9 @@
         const currentHostPC = hostPC;
 
         hostPC.onicecandidate = () => {};
+        hostPC.onicecandidateerror = (event) => {
+            if (hostPC === currentHostPC) reportIceServerError(event);
+        };
 
         hostPC.onicegatheringstatechange = () => {
             if (hostPC === currentHostPC && currentHostPC.iceGatheringState === 'complete') {
@@ -817,6 +827,9 @@
 
             guestPC = new RTCPeerConnection(STUN_SERVERS);
             const currentGuestPC = guestPC;
+            guestPC.onicecandidateerror = (event) => {
+                if (guestPC === currentGuestPC) reportIceServerError(event);
+            };
 
             guestPC.onconnectionstatechange = () => {
                 if (guestPC !== currentGuestPC) return;
