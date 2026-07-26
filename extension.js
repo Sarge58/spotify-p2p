@@ -47,20 +47,50 @@
         return { name: 'Unknown', image: null, uri: null };
     }
 
-    function encode(obj) {
-        const bytes = new TextEncoder().encode(JSON.stringify(obj));
+    function bytesToBase64Url(bytes) {
         let binary = '';
         const chunkSize = 0x8000;
         for (let start = 0; start < bytes.length; start += chunkSize) {
             binary += String.fromCharCode(...bytes.subarray(start, start + chunkSize));
         }
-        return btoa(binary);
+        return btoa(binary).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
     }
 
-    function decode(str) {
-        const binary = atob(str);
-        const bytes = Uint8Array.from(binary, (character) => character.charCodeAt(0));
-        return JSON.parse(new TextDecoder().decode(bytes));
+    function base64UrlToBytes(encoded) {
+        const normalized = encoded.replace(/-/g, '+').replace(/_/g, '/');
+        const padded = normalized + '='.repeat((4 - normalized.length % 4) % 4);
+        return Uint8Array.from(atob(padded), (character) => character.charCodeAt(0));
+    }
+
+    async function encode(obj) {
+        const bytes = new TextEncoder().encode(JSON.stringify(obj));
+        if (!globalThis.CompressionStream) return `j.${bytesToBase64Url(bytes)}`;
+
+        try {
+            const compressed = new Blob([bytes]).stream().pipeThrough(new CompressionStream('deflate-raw'));
+            const output = new Uint8Array(await new Response(compressed).arrayBuffer());
+            return `z.${bytesToBase64Url(output)}`;
+        } catch (error) {
+            console.warn('SpotifyP2P: Compression unavailable; using plain signaling', error);
+            return `j.${bytesToBase64Url(bytes)}`;
+        }
+    }
+
+    async function decode(str) {
+        // Accept offers from the pre-compression extension as well as new codes.
+        if (!str.startsWith('z.') && !str.startsWith('j.')) {
+            const binary = atob(str);
+            const legacyBytes = Uint8Array.from(binary, (character) => character.charCodeAt(0));
+            return JSON.parse(new TextDecoder().decode(legacyBytes));
+        }
+
+        const format = str.slice(0, 1);
+        const bytes = base64UrlToBytes(str.slice(2));
+        if (format === 'j') return JSON.parse(new TextDecoder().decode(bytes));
+        if (!globalThis.DecompressionStream) throw new Error('This Spotify version cannot read compressed signaling codes');
+
+        const decompressed = new Blob([bytes]).stream().pipeThrough(new DecompressionStream('deflate-raw'));
+        return JSON.parse(await new Response(decompressed).text());
     }
 
     function getPlayerState() {
@@ -559,8 +589,8 @@
         }
     }
 
-    function parseDescription(text, expectedType) {
-        const description = decode(text);
+    async function parseDescription(text, expectedType) {
+        const description = await decode(text);
         if (!description || description.type !== expectedType || typeof description.sdp !== 'string') {
             throw new Error(`Expected a WebRTC ${expectedType} description`);
         }
@@ -622,9 +652,11 @@
         updateHostOffer();
     }
 
-    function updateHostOffer() {
+    async function updateHostOffer() {
         if (!hostPC || !hostPC.localDescription) return;
-        const encoded = encode(hostPC.localDescription);
+        const peerConnection = hostPC;
+        const encoded = await encode(peerConnection.localDescription);
+        if (hostPC !== peerConnection) return;
         const el = document.getElementById('p2p-host-offer');
         el.textContent = encoded;
         document.getElementById('p2p-host-copy').disabled = false;
@@ -663,7 +695,7 @@
 
         try {
             if (!hostPC) throw new Error('Host session is no longer active');
-            const answer = parseDescription(text, 'answer');
+            const answer = await parseDescription(text, 'answer');
             await hostPC.setRemoteDescription(answer);
             setConnectionState('connecting');
             input.value = '';
@@ -712,7 +744,7 @@
                 setupDataChannel(e.channel, false);
             };
 
-            const offer = parseDescription(text, 'offer');
+            const offer = await parseDescription(text, 'offer');
             await guestPC.setRemoteDescription(offer);
 
             const answer = await guestPC.createAnswer();
@@ -720,7 +752,7 @@
 
             await waitForIceGatheringComplete(guestPC);
 
-            const encoded = encode(guestPC.localDescription);
+            const encoded = await encode(guestPC.localDescription);
             document.getElementById('p2p-join-answer').textContent = encoded;
             document.getElementById('p2p-join-answer').classList.remove('hidden');
             document.getElementById('p2p-join-copy').classList.remove('hidden');
