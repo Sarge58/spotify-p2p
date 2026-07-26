@@ -15,7 +15,6 @@
     };
     const DRIFT_THRESHOLD = 500;
     const HEARTBEAT_INTERVAL = 1000;
-    const RECONNECT_INTERVAL = 3000;
     const TOAST_DURATION = 3000;
 
     let isHost = false;
@@ -25,7 +24,6 @@
     let dataChannel = null;
     let remoteProfile = null;
     let heartbeatInterval = null;
-    let reconnectTimer = null;
     let connectionState = 'disconnected';
     let topbarObserver = null;
     let applyingState = false;
@@ -460,6 +458,7 @@
                         </div>
                         <textarea id="p2p-host-answer" class="p2p-input" placeholder="Paste guest's response code here..." rows="3"></textarea>
                         <button id="p2p-host-accept" class="p2p-btn primary">Accept Answer</button>
+                        <button id="p2p-host-reconnect" class="p2p-btn">Generate New Connection Code</button>
 
                         <div id="p2p-host-session" class="hidden">
                             <hr class="p2p-divider">
@@ -509,6 +508,7 @@
 
                         <hr class="p2p-divider">
                         <button id="p2p-sync-btn" class="p2p-btn">Sync Now</button>
+                        <button id="p2p-session-reconnect" class="p2p-btn hidden">Reconnect</button>
                         <button id="p2p-session-leave" class="p2p-btn danger">Leave Session</button>
                     </div>
                 </div>
@@ -522,12 +522,14 @@
         document.getElementById('p2p-join-btn').onclick = showJoinView;
         document.getElementById('p2p-host-copy').onclick = copyHostOffer;
         document.getElementById('p2p-host-accept').onclick = acceptAnswer;
+        document.getElementById('p2p-host-reconnect').onclick = startHost;
         document.getElementById('p2p-host-leave').onclick = leave;
         document.getElementById('p2p-host-sync').onclick = manualSync;
         document.getElementById('p2p-join-connect').onclick = generateAnswer;
         document.getElementById('p2p-join-copy').onclick = copyJoinAnswer;
         document.getElementById('p2p-join-back').onclick = showHome;
         document.getElementById('p2p-sync-btn').onclick = manualSync;
+        document.getElementById('p2p-session-reconnect').onclick = beginGuestReconnect;
         document.getElementById('p2p-session-leave').onclick = leave;
     }
 
@@ -561,6 +563,27 @@
         document.getElementById('p2p-host').classList.add('hidden');
         document.getElementById('p2p-join').classList.add('hidden');
         document.getElementById('p2p-session').classList.remove('hidden');
+    }
+
+    function setGuestConnectionStatus(label, state) {
+        const dot = document.getElementById('p2p-connection-dot2');
+        const status = document.getElementById('p2p-connection-label2');
+        if (dot) dot.className = `p2p-dot p2p-dot-${state}`;
+        if (status) status.textContent = label;
+    }
+
+    function prepareGuestReconnect() {
+        showSessionView();
+        setGuestConnectionStatus('Disconnected — get a new code from the host', 'disconnected');
+        document.getElementById('p2p-sync-btn').disabled = true;
+        document.getElementById('p2p-session-reconnect').classList.remove('hidden');
+    }
+
+    function beginGuestReconnect() {
+        leave();
+        showJoinView();
+        document.getElementById('p2p-join-offer').focus();
+        showToast('Ask the host for their new connection code', 'info');
     }
 
     function waitForIceGatheringComplete(peerConnection, timeout = 10000) {
@@ -630,8 +653,7 @@
             } else if (state === 'disconnected' || state === 'failed') {
                 setConnectionState('disconnected');
                 document.getElementById('p2p-host-session').classList.add('hidden');
-                showToast('Guest disconnected', 'error');
-                scheduleReconnect();
+                showToast('Guest disconnected — generate a new code to reconnect', 'error');
             } else if (state === 'connecting') {
                 setConnectionState('connecting');
             }
@@ -741,7 +763,7 @@
                 const state = currentGuestPC.connectionState;
                 if (state === 'disconnected' || state === 'failed') {
                     showToast('Disconnected from host', 'error');
-                    showHome();
+                    prepareGuestReconnect();
                 }
             };
 
@@ -807,6 +829,9 @@
             } else {
                 setConnectionState('connected');
                 showSessionView();
+                setGuestConnectionStatus('Connected to host', 'connected');
+                document.getElementById('p2p-sync-btn').disabled = false;
+                document.getElementById('p2p-session-reconnect').classList.add('hidden');
             }
         };
 
@@ -828,7 +853,7 @@
             setConnectionState('disconnected');
             if (!isHost) {
                 showToast('Disconnected from host', 'error');
-                showHome();
+                prepareGuestReconnect();
             } else {
                 showToast('Guest disconnected', 'error');
                 document.getElementById('p2p-host-session').classList.add('hidden');
@@ -898,19 +923,6 @@
         el.appendChild(peer);
     }
 
-    // ── Reconnection ──
-
-    function scheduleReconnect() {
-        if (reconnectTimer) return;
-        setConnectionState('reconnecting');
-        reconnectTimer = setTimeout(() => {
-            reconnectTimer = null;
-            if (isHost && hostPC) {
-                showToast('Attempting to reconnect...', 'warning');
-            }
-        }, RECONNECT_INTERVAL);
-    }
-
     // ── Sync ──
 
     function manualSync() {
@@ -927,7 +939,6 @@
 
     function leave() {
         stopHeartbeat();
-        if (reconnectTimer) { clearTimeout(reconnectTimer); reconnectTimer = null; }
         if (dataChannel) { try { dataChannel.close(); } catch(e) {} }
         if (hostPC) { try { hostPC.close(); } catch(e) {} }
         if (guestPC) { try { guestPC.close(); } catch(e) {} }
@@ -951,6 +962,9 @@
         document.getElementById('p2p-join-answer').classList.add('hidden');
         document.getElementById('p2p-join-copy').classList.add('hidden');
         document.getElementById('p2p-join-error').classList.add('hidden');
+        document.getElementById('p2p-session-reconnect').classList.add('hidden');
+        document.getElementById('p2p-sync-btn').disabled = false;
+        setGuestConnectionStatus('Connected to host', 'connected');
         document.getElementById('p2p-now-playing').classList.add('hidden');
         document.getElementById('p2p-peer-info').innerHTML = '';
     }
