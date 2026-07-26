@@ -506,6 +506,26 @@
         document.getElementById('p2p-session').classList.remove('hidden');
     }
 
+    function waitForIceGatheringComplete(peerConnection, timeout = 10000) {
+        return new Promise((resolve) => {
+            if (peerConnection.iceGatheringState === 'complete') {
+                resolve();
+                return;
+            }
+
+            const finish = () => {
+                clearTimeout(timer);
+                peerConnection.removeEventListener('icegatheringstatechange', check);
+                resolve();
+            };
+            const check = () => {
+                if (peerConnection.iceGatheringState === 'complete') finish();
+            };
+            const timer = setTimeout(finish, timeout);
+            peerConnection.addEventListener('icegatheringstatechange', check);
+        });
+    }
+
     // ── Host ──
 
     async function startHost() {
@@ -542,11 +562,17 @@
             setupDataChannel(e.channel, true);
         };
 
+        // The host must create the channel before the offer; otherwise there is
+        // nothing in the SDP to negotiate and no usable code is produced.
+        setupDataChannel(hostPC.createDataChannel('spotify-p2p', { ordered: true }), true);
+
         const offer = await hostPC.createOffer();
         await hostPC.setLocalDescription(offer);
 
         showHostView();
         setConnectionState('connecting');
+        await waitForIceGatheringComplete(hostPC);
+        updateHostOffer();
     }
 
     function updateHostOffer() {
@@ -636,14 +662,7 @@
             const answer = await guestPC.createAnswer();
             await guestPC.setLocalDescription(answer);
 
-            await new Promise((resolve) => {
-                if (guestPC.iceGatheringState === 'complete') { resolve(); return; }
-                const check = () => {
-                    if (guestPC.iceGatheringState === 'complete') { resolve(); return; }
-                    setTimeout(check, 100);
-                };
-                check();
-            });
+            await waitForIceGatheringComplete(guestPC);
 
             const encoded = encode(guestPC.localDescription);
             document.getElementById('p2p-join-answer').textContent = encoded;
