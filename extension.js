@@ -610,17 +610,19 @@
         isGuest = false;
 
         hostPC = new RTCPeerConnection(STUN_SERVERS);
+        const currentHostPC = hostPC;
 
         hostPC.onicecandidate = () => {};
 
         hostPC.onicegatheringstatechange = () => {
-            if (hostPC.iceGatheringState === 'complete') {
+            if (hostPC === currentHostPC && currentHostPC.iceGatheringState === 'complete') {
                 updateHostOffer();
             }
         };
 
         hostPC.onconnectionstatechange = () => {
-            const state = hostPC.connectionState;
+            if (hostPC !== currentHostPC) return;
+            const state = currentHostPC.connectionState;
             if (state === 'connected') {
                 setConnectionState('connected');
                 document.getElementById('p2p-host-session').classList.remove('hidden');
@@ -636,6 +638,7 @@
         };
 
         hostPC.ondatachannel = (e) => {
+            if (hostPC !== currentHostPC) return;
             setupDataChannel(e.channel, true);
         };
 
@@ -731,9 +734,11 @@
             isHost = false;
 
             guestPC = new RTCPeerConnection(STUN_SERVERS);
+            const currentGuestPC = guestPC;
 
             guestPC.onconnectionstatechange = () => {
-                const state = guestPC.connectionState;
+                if (guestPC !== currentGuestPC) return;
+                const state = currentGuestPC.connectionState;
                 if (state === 'disconnected' || state === 'failed') {
                     showToast('Disconnected from host', 'error');
                     showHome();
@@ -741,6 +746,7 @@
             };
 
             guestPC.ondatachannel = (e) => {
+                if (guestPC !== currentGuestPC) return;
                 setupDataChannel(e.channel, false);
             };
 
@@ -790,6 +796,7 @@
         dataChannel = channel;
 
         channel.onopen = () => {
+            if (dataChannel !== channel) return;
             console.log('SpotifyP2P: Channel open');
             sendData({ type: 'profile', profile: getProfile() });
 
@@ -804,6 +811,7 @@
         };
 
         channel.onmessage = (e) => {
+            if (dataChannel !== channel) return;
             try {
                 const data = JSON.parse(e.data);
                 if (isHost) handleHostMessage(data);
@@ -814,6 +822,7 @@
         };
 
         channel.onclose = () => {
+            if (dataChannel !== channel) return;
             console.log('SpotifyP2P: Channel closed');
             stopHeartbeat();
             setConnectionState('disconnected');
@@ -827,6 +836,7 @@
         };
 
         channel.onerror = (e) => {
+            if (dataChannel !== channel) return;
             console.error('SpotifyP2P: Channel error', e);
         };
     }
@@ -867,12 +877,25 @@
     function updateGuestDisplay() {
         const el = document.getElementById(isHost ? 'p2p-host-guests' : 'p2p-peer-info');
         if (!el || !remoteProfile) return;
-        el.innerHTML = `
-            <div class="p2p-peer">
-                ${remoteProfile.image ? `<img src="${remoteProfile.image}" class="p2p-avatar">` : '<div class="p2p-avatar"></div>'}
-                <span class="p2p-peer-name">${escapeHtml(remoteProfile.name)}</span>
-            </div>
-        `;
+        el.replaceChildren();
+        const peer = document.createElement('div');
+        peer.className = 'p2p-peer';
+        if (typeof remoteProfile.image === 'string' && remoteProfile.image.startsWith('https://i.scdn.co/')) {
+            const image = document.createElement('img');
+            image.className = 'p2p-avatar';
+            image.src = remoteProfile.image;
+            image.alt = '';
+            peer.appendChild(image);
+        } else {
+            const avatar = document.createElement('div');
+            avatar.className = 'p2p-avatar';
+            peer.appendChild(avatar);
+        }
+        const name = document.createElement('span');
+        name.className = 'p2p-peer-name';
+        name.textContent = typeof remoteProfile.name === 'string' ? remoteProfile.name : 'Unknown';
+        peer.appendChild(name);
+        el.appendChild(peer);
     }
 
     // ── Reconnection ──
