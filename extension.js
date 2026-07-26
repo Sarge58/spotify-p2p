@@ -15,6 +15,7 @@
     };
     const DRIFT_THRESHOLD = 500;
     const HEARTBEAT_INTERVAL = 1000;
+    const DISCONNECT_GRACE_PERIOD = 5000;
     const TOAST_DURATION = 3000;
 
     let isHost = false;
@@ -28,6 +29,7 @@
     let heartbeatInterval = null;
     let connectionState = 'disconnected';
     let topbarObserver = null;
+    let disconnectTimer = null;
     let applyingState = false;
     let pendingState = null;
 
@@ -581,6 +583,26 @@
         if (status) status.textContent = label;
     }
 
+    function clearDisconnectGracePeriod() {
+        if (!disconnectTimer) return;
+        clearTimeout(disconnectTimer);
+        disconnectTimer = null;
+    }
+
+    function handleConnectionLoss(peerConnection, onFailure) {
+        if (peerConnection.connectionState === 'failed') {
+            clearDisconnectGracePeriod();
+            onFailure();
+            return;
+        }
+        if (peerConnection.connectionState !== 'disconnected' || disconnectTimer) return;
+
+        disconnectTimer = setTimeout(() => {
+            disconnectTimer = null;
+            if (peerConnection.connectionState === 'disconnected') onFailure();
+        }, DISCONNECT_GRACE_PERIOD);
+    }
+
     function prepareGuestReconnect() {
         showSessionView();
         setGuestConnectionStatus('Disconnected — get a new code from the host', 'disconnected');
@@ -652,6 +674,7 @@
     // ── Host ──
 
     async function startHost() {
+        clearDisconnectGracePeriod();
         closePeerConnection(hostPC);
         closePeerConnection(guestPC);
         hostPC = null;
@@ -678,13 +701,17 @@
             if (hostPC !== currentHostPC) return;
             const state = currentHostPC.connectionState;
             if (state === 'connected') {
+                clearDisconnectGracePeriod();
                 setConnectionState('connected');
                 document.getElementById('p2p-host-session').classList.remove('hidden');
                 showToast('Guest connected!', 'info');
             } else if (state === 'disconnected' || state === 'failed') {
+                if (state === 'disconnected') setConnectionState('reconnecting');
+                handleConnectionLoss(currentHostPC, () => {
                 setConnectionState('disconnected');
                 document.getElementById('p2p-host-session').classList.add('hidden');
-                showToast('Guest disconnected — generate a new code to reconnect', 'error');
+                showToast('Direct connection failed — generate a new code to reconnect', 'error');
+                });
             } else if (state === 'connecting') {
                 setConnectionState('connecting');
             }
@@ -780,6 +807,7 @@
         errorEl.classList.add('hidden');
 
         try {
+            clearDisconnectGracePeriod();
             closePeerConnection(guestPC);
             guestPC = null;
             dataChannel = null;
@@ -793,9 +821,14 @@
             guestPC.onconnectionstatechange = () => {
                 if (guestPC !== currentGuestPC) return;
                 const state = currentGuestPC.connectionState;
-                if (state === 'disconnected' || state === 'failed') {
-                    showToast('Disconnected from host', 'error');
-                    prepareGuestReconnect();
+                if (state === 'connected') {
+                    clearDisconnectGracePeriod();
+                } else if (state === 'disconnected' || state === 'failed') {
+                    if (state === 'disconnected') setGuestConnectionStatus('Reconnecting...', 'connecting');
+                    handleConnectionLoss(currentGuestPC, () => {
+                        showToast('Direct connection failed — ask the host for a new code', 'error');
+                        prepareGuestReconnect();
+                    });
                 }
             };
 
@@ -851,6 +884,7 @@
 
         channel.onopen = () => {
             if (dataChannel !== channel) return;
+            clearDisconnectGracePeriod();
             console.log('SpotifyP2P: Channel open');
 
             if (isHost) {
@@ -993,6 +1027,7 @@
 
     function leave() {
         stopHeartbeat();
+        clearDisconnectGracePeriod();
         if (dataChannel) { try { dataChannel.close(); } catch(e) {} }
         if (hostPC) { try { hostPC.close(); } catch(e) {} }
         if (guestPC) { try { guestPC.close(); } catch(e) {} }
