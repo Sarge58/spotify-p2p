@@ -42,6 +42,7 @@ Once Marketplace has indexed this repository, search for **SpotifyP2P** and inst
 2. One person selects **Host Session**, then copies the generated offer code.
 3. The guest pastes that offer into **Join Session**, generates a response, and sends the response back.
 4. The host pastes the response and accepts it. The session starts when the connection status becomes connected.
+5. The host reviews the joining profile and clicks **Approve Guest** before playback state or guest controls are enabled.
 
 ## Notes and limitations
 
@@ -49,6 +50,7 @@ Once Marketplace has indexed this repository, search for **SpotifyP2P** and inst
 - SpotifyP2P uses direct WebRTC data channels. It has no relay server, so restrictive firewalls or symmetric NATs can prevent a connection.
 - Google public STUN servers help peers find each other. The extension does not host or proxy your Spotify credentials or audio.
 - This is playback synchronization, not shared audio streaming.
+- Treat an offer/answer code as a one-time invite. The host must explicitly approve each connected guest before sharing playback state.
 
 ## Troubleshooting
 

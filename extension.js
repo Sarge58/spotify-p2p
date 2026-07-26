@@ -23,6 +23,8 @@
     let guestPC = null;
     let dataChannel = null;
     let remoteProfile = null;
+    let guestApproved = false;
+    let hostApproved = false;
     let heartbeatInterval = null;
     let connectionState = 'disconnected';
     let topbarObserver = null;
@@ -464,7 +466,12 @@
                             <hr class="p2p-divider">
                             <div id="p2p-host-now-playing" class="p2p-now-playing-host"></div>
                             <div id="p2p-host-guests"></div>
-                            <button id="p2p-host-sync" class="p2p-btn">Sync Now</button>
+                            <div id="p2p-host-approval" class="hidden">
+                                <p class="p2p-status waiting">Review the guest above before sharing playback.</p>
+                                <button id="p2p-host-approve" class="p2p-btn primary">Approve Guest</button>
+                                <button id="p2p-host-reject" class="p2p-btn danger">Reject Guest</button>
+                            </div>
+                            <button id="p2p-host-sync" class="p2p-btn" disabled>Sync Now</button>
                         </div>
 
                         <hr class="p2p-divider">
@@ -525,6 +532,8 @@
         document.getElementById('p2p-host-reconnect').onclick = startHost;
         document.getElementById('p2p-host-leave').onclick = leave;
         document.getElementById('p2p-host-sync').onclick = manualSync;
+        document.getElementById('p2p-host-approve').onclick = approveGuest;
+        document.getElementById('p2p-host-reject').onclick = rejectGuest;
         document.getElementById('p2p-join-connect').onclick = generateAnswer;
         document.getElementById('p2p-join-copy').onclick = copyJoinAnswer;
         document.getElementById('p2p-join-back').onclick = showHome;
@@ -586,6 +595,26 @@
         showToast('Ask the host for their new connection code', 'info');
     }
 
+    function approveGuest() {
+        if (!isHost || !dataChannel || !remoteProfile) {
+            showToast('No guest is waiting for approval', 'warning');
+            return;
+        }
+        guestApproved = true;
+        document.getElementById('p2p-host-approval').classList.add('hidden');
+        document.getElementById('p2p-host-sync').disabled = false;
+        sendData({ type: 'profile', profile: getProfile() });
+        sendData({ type: 'approved' });
+        startHeartbeat();
+        broadcastState();
+        showToast(`${remoteProfile.name} approved`, 'info');
+    }
+
+    function rejectGuest() {
+        showToast('Guest rejected', 'info');
+        leave();
+    }
+
     function waitForIceGatheringComplete(peerConnection, timeout = 10000) {
         return new Promise((resolve) => {
             if (peerConnection.iceGatheringState === 'complete') {
@@ -629,6 +658,8 @@
         guestPC = null;
         dataChannel = null;
         remoteProfile = null;
+        guestApproved = false;
+        hostApproved = false;
         isHost = true;
         isGuest = false;
 
@@ -754,6 +785,7 @@
             dataChannel = null;
             isGuest = true;
             isHost = false;
+            hostApproved = false;
 
             guestPC = new RTCPeerConnection(STUN_SERVERS);
             const currentGuestPC = guestPC;
@@ -820,17 +852,15 @@
         channel.onopen = () => {
             if (dataChannel !== channel) return;
             console.log('SpotifyP2P: Channel open');
-            sendData({ type: 'profile', profile: getProfile() });
 
             if (isHost) {
                 setConnectionState('connected');
-                startHeartbeat();
-                broadcastState();
             } else {
+                sendData({ type: 'profile', profile: getProfile() });
                 setConnectionState('connected');
                 showSessionView();
-                setGuestConnectionStatus('Connected to host', 'connected');
-                document.getElementById('p2p-sync-btn').disabled = false;
+                setGuestConnectionStatus('Waiting for host approval', 'connecting');
+                document.getElementById('p2p-sync-btn').disabled = true;
                 document.getElementById('p2p-session-reconnect').classList.add('hidden');
             }
         };
@@ -869,11 +899,13 @@
     function handleHostMessage(data) {
         switch (data.type) {
             case 'profile':
-                remoteProfile = data.profile;
+                remoteProfile = normalizeProfile(data.profile);
                 updateGuestDisplay();
-                showToast(`${data.profile.name} joined`, 'info');
+                document.getElementById('p2p-host-approval').classList.remove('hidden');
+                showToast(`${remoteProfile.name} wants to join`, 'info');
                 break;
             case 'control':
+                if (!guestApproved) return;
                 if (data.action === 'play') Spicetify.Player.play();
                 else if (data.action === 'pause') Spicetify.Player.pause();
                 else if (data.action === 'next') Spicetify.Player.next();
@@ -882,7 +914,7 @@
                 setTimeout(broadcastState, 100);
                 break;
             case 'request-sync':
-                broadcastState();
+                if (guestApproved) broadcastState();
                 break;
         }
     }
@@ -890,13 +922,27 @@
     function handleGuestMessage(data) {
         switch (data.type) {
             case 'sync':
-                applyState(data.state);
+                if (hostApproved) applyState(data.state);
                 break;
             case 'profile':
-                remoteProfile = data.profile;
+                remoteProfile = normalizeProfile(data.profile);
                 updateGuestDisplay();
                 break;
+            case 'approved':
+                hostApproved = true;
+                setGuestConnectionStatus('Connected to host', 'connected');
+                document.getElementById('p2p-sync-btn').disabled = false;
+                showToast('Host approved this session', 'info');
+                break;
         }
+    }
+
+    function normalizeProfile(profile) {
+        return {
+            name: typeof profile?.name === 'string' && profile.name.trim() ? profile.name.slice(0, 80) : 'Unknown',
+            image: typeof profile?.image === 'string' ? profile.image : null,
+            uri: typeof profile?.uri === 'string' ? profile.uri : null
+        };
     }
 
     function updateGuestDisplay() {
@@ -927,9 +973,17 @@
 
     function manualSync() {
         if (isHost) {
+            if (!guestApproved) {
+                showToast('Approve the guest before syncing', 'warning');
+                return;
+            }
             broadcastState();
             showToast('Synced all listeners', 'info');
         } else {
+            if (!hostApproved) {
+                showToast('Waiting for host approval', 'warning');
+                return;
+            }
             sendData({ type: 'request-sync' });
             showToast('Sync requested', 'info');
         }
@@ -947,6 +1001,8 @@
         guestPC = null;
         remoteProfile = null;
         pendingState = null;
+        guestApproved = false;
+        hostApproved = false;
         isHost = false;
         isGuest = false;
         setConnectionState('disconnected');
@@ -963,6 +1019,8 @@
         document.getElementById('p2p-join-copy').classList.add('hidden');
         document.getElementById('p2p-join-error').classList.add('hidden');
         document.getElementById('p2p-session-reconnect').classList.add('hidden');
+        document.getElementById('p2p-host-approval').classList.add('hidden');
+        document.getElementById('p2p-host-sync').disabled = true;
         document.getElementById('p2p-sync-btn').disabled = false;
         setGuestConnectionStatus('Connected to host', 'connected');
         document.getElementById('p2p-now-playing').classList.add('hidden');
