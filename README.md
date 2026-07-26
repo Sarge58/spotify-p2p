@@ -1,99 +1,59 @@
 # SpotifyP2P
 
-Listen to Spotify together with friends in real-time using P2P WebRTC.
+Listen to Spotify with a friend in sync, directly from the Spotify desktop app.
 
-## Features
+SpotifyP2P is a [Spicetify](https://spicetify.app/) extension that uses WebRTC to create a direct peer-to-peer connection. The host controls playback and broadcasts playback state so guests stay aligned.
 
-- **P2P Connection** — Direct peer-to-peer, no server required
-- **Playback Sync** — Play, pause, skip, and seek in sync
-- **Shared Queue** — Everyone sees the same queue
-- **User Profiles** — Shows Spotify profile pictures
-- **Auto-Drift Correction** — Fixes audio drift automatically
-- **Manual Sync** — Resync whenever you want
+![SpotifyP2P preview](assets/preview.svg)
 
-## Prerequisites
+## What it does
 
-- [Spicetify](https://spicetify.app/) installed
-- Spotify desktop app
+- Adds a native-looking P2P button immediately to the left of Spotify's **What's New** button.
+- Connects two Spotify desktop clients with WebRTC and public STUN servers.
+- Synchronizes play, pause, track changes, seek position, and periodic host-state heartbeats.
+- Provides manual re-sync and automatic correction when playback drifts.
+- Keeps session signaling manual: exchange the generated offer and answer codes with your friend.
 
-## Installation
+## Install
 
-### Option A: Manual Install
+### Spicetify Marketplace
 
-1. Download `extension.js` from this repo
-2. Copy the file to your Spicetify Extensions folder:
-   - **Windows:** `%appdata%\spicetify\Extensions\`
-   - **macOS:** `~/.config/spicetify/Extensions/`
-   - **Linux:** `~/.config/spicetify/Extensions/`
+Once Marketplace has indexed this repository, search for **SpotifyP2P** and install it from the Extensions tab.
 
-3. Run:
+### Manual installation
+
+1. Download [extension.js](extension.js).
+2. Copy it into your Spicetify Extensions folder:
+
+   ```text
+   ~/.config/spicetify/Extensions/
+   ```
+
+3. Apply it:
+
    ```bash
    spicetify config extensions extension.js
    spicetify apply
    ```
 
-### Option B: Via Marketplace
+## Start a session
 
-1. Open Spotify
-2. Click the Marketplace icon (puzzle piece)
-3. Search for "SpotifyP2P"
-4. Click Install
+1. Click the SpotifyP2P button beside **What's New**.
+2. One person selects **Host Session**, then copies the generated offer code.
+3. The guest pastes that offer into **Join Session**, generates a response, and sends the response back.
+4. The host pastes the response and accepts it. The session starts when the connection status becomes connected.
 
-## Usage
+## Notes and limitations
 
-### Host a Session
-
-1. Click the SpotifyP2P icon (bottom-right)
-2. Click **Host Session**
-3. Share the 6-character room code with friends
-4. Music syncs automatically
-
-### Join a Session
-
-1. Click the SpotifyP2P icon
-2. Click **Join Session**
-3. Enter the 6-character code
-4. Click **Connect**
-
-### Controls
-
-| Action | What Happens |
-|--------|--------------|
-| Host plays/pauses | Everyone follows |
-| Host skips | Everyone skips |
-| Host seeks | Everyone seeks |
-| Guest controls | Sent to host, executed for all |
-| Sync Now | Manually resync position |
-
-## How It Works
-
-1. **WebRTC P2P** — Direct connection between users via STUN servers
-2. **NAT Traversal** — Uses public STUN servers to connect through firewalls
-3. **Heartbeat Sync** — Host broadcasts position every 1 second
-4. **Drift Correction** — Auto-syncs every 5 seconds if drift > 500ms
+- Each person needs Spotify desktop with Spicetify and access to the same music in their own Spotify account.
+- SpotifyP2P uses direct WebRTC data channels. It has no relay server, so restrictive firewalls or symmetric NATs can prevent a connection.
+- Google public STUN servers help peers find each other. The extension does not host or proxy your Spotify credentials or audio.
+- This is playback synchronization, not shared audio streaming.
 
 ## Troubleshooting
 
-**Connection fails:**
-- Check firewall settings (WebRTC needs UDP)
-- Try a different network
-- Restart Spotify
-
-**Audio out of sync:**
-- Click **Sync Now** to manually resync
-- Check internet connection stability
-
-**Extension not showing:**
-- Restart Spotify after install
-- Run `spicetify apply` again
-
-## Technical Details
-
-- Built with vanilla JavaScript + Spicetify API
-- WebRTC for P2P connections
-- Public STUN servers for NAT traversal
-- No external dependencies
+If the button is missing, run `spicetify apply` and restart Spotify. If a peer connection fails, try a different network or check that the firewall permits WebRTC/UDP traffic.
 
 ## License
 
-MIT
+[MIT](LICENSE)

@@ -1,0 +1,21 @@
+[
+  {
+    "name": "SpotifyP2P",
+    "description": "Listen together in sync using direct WebRTC playback synchronization.",
+    "preview": "assets/preview.svg",
+    "main": "extension.js",
+    "readme": "README.md",
+    "branch": "main",
+    "authors": [
+      {
+        "name": "Sarge58",
+        "url": "https://github.com/Sarge58"
+      }
+    ],
+    "tags": [
+      "webrtc",
+      "listen-together",
+      "playback-sync"
+    ]
+  }
+]
