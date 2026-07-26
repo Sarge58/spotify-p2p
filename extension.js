@@ -28,6 +28,8 @@
     let reconnectTimer = null;
     let connectionState = 'disconnected';
     let topbarObserver = null;
+    let applyingState = false;
+    let pendingState = null;
 
     // ── Helpers ──
 
@@ -77,22 +79,44 @@
     }
 
     async function applyState(state) {
-        const p = Spicetify.Player;
-        if (!p || !state) return;
-
-        if (state.uri && p.data?.item?.uri !== state.uri) {
-            await Spicetify.Player.playUri(state.uri);
-            await new Promise(r => setTimeout(r, 300));
+        if (!state) return;
+        if (applyingState) {
+            pendingState = state;
+            return;
         }
 
-        if (Math.abs(p.getPosition() - state.pos) > DRIFT_THRESHOLD) {
-            p.seek(state.pos);
+        applyingState = true;
+        try {
+            const p = Spicetify.Player;
+            if (!p) return;
+
+            if (state.uri && p.data?.item?.uri !== state.uri) {
+                await p.playUri(state.uri);
+                await new Promise((resolve) => setTimeout(resolve, 300));
+            }
+
+            // Account for the short trip from the host to this peer while the
+            // host is playing, rather than synchronizing to an already-stale position.
+            const elapsed = state.playing && state.ts ? Math.max(0, Date.now() - state.ts) : 0;
+            const targetPosition = state.pos + elapsed;
+            if (Math.abs(p.getPosition() - targetPosition) > DRIFT_THRESHOLD) {
+                p.seek(targetPosition);
+            }
+
+            if (state.playing && !p.isPlaying()) p.play();
+            else if (!state.playing && p.isPlaying()) p.pause();
+
+            updateNowPlaying(state);
+        } catch (error) {
+            console.error('SpotifyP2P: Failed to apply playback state', error);
+        } finally {
+            applyingState = false;
+            if (pendingState) {
+                const nextState = pendingState;
+                pendingState = null;
+                applyState(nextState);
+            }
         }
-
-        if (state.playing && !p.isPlaying()) p.play();
-        else if (!state.playing && p.isPlaying()) p.pause();
-
-        updateNowPlaying(state);
     }
 
     function sendData(data) {
@@ -103,7 +127,10 @@
 
     function broadcastState() {
         const state = getPlayerState();
-        if (state) sendData({ type: 'sync', state });
+        if (state) {
+            sendData({ type: 'sync', state });
+            if (isHost) updateNowPlaying(state, 'p2p-host-now-playing');
+        }
     }
 
     function startHeartbeat() {
@@ -170,8 +197,8 @@
 
     // ── Now Playing ──
 
-    function updateNowPlaying(state) {
-        const el = document.getElementById('p2p-now-playing');
+    function updateNowPlaying(state, elementId = 'p2p-now-playing') {
+        const el = document.getElementById(elementId);
         if (!el || !state) return;
 
         if (state.name) {
@@ -393,7 +420,7 @@
                             <div class="p2p-step-text">Copy this code and send it to your friend</div>
                         </div>
                         <div id="p2p-host-offer" class="p2p-code">Generating...</div>
-                        <button id="p2p-host-copy" class="p2p-btn">Copy Code</button>
+                        <button id="p2p-host-copy" class="p2p-btn" disabled>Copy Code</button>
 
                         <hr class="p2p-divider">
 
@@ -526,9 +553,29 @@
         });
     }
 
+    function closePeerConnection(peerConnection) {
+        if (peerConnection && peerConnection.connectionState !== 'closed') {
+            try { peerConnection.close(); } catch (error) {}
+        }
+    }
+
+    function parseDescription(text, expectedType) {
+        const description = decode(text);
+        if (!description || description.type !== expectedType || typeof description.sdp !== 'string') {
+            throw new Error(`Expected a WebRTC ${expectedType} description`);
+        }
+        return description;
+    }
+
     // ── Host ──
 
     async function startHost() {
+        closePeerConnection(hostPC);
+        closePeerConnection(guestPC);
+        hostPC = null;
+        guestPC = null;
+        dataChannel = null;
+        remoteProfile = null;
         isHost = true;
         isGuest = false;
 
@@ -580,6 +627,7 @@
         const encoded = encode(hostPC.localDescription);
         const el = document.getElementById('p2p-host-offer');
         el.textContent = encoded;
+        document.getElementById('p2p-host-copy').disabled = false;
         el.title = 'Click to select all';
         el.onclick = () => {
             const range = document.createRange();
@@ -591,6 +639,10 @@
 
     function copyHostOffer() {
         const text = document.getElementById('p2p-host-offer').textContent;
+        if (!hostPC || !hostPC.localDescription || text === 'Generating...') {
+            showToast('Your connection code is still being generated', 'warning');
+            return;
+        }
         navigator.clipboard.writeText(text).then(() => {
             const btn = document.getElementById('p2p-host-copy');
             btn.textContent = 'Copied!';
@@ -610,7 +662,8 @@
         }
 
         try {
-            const answer = decode(text);
+            if (!hostPC) throw new Error('Host session is no longer active');
+            const answer = parseDescription(text, 'answer');
             await hostPC.setRemoteDescription(answer);
             setConnectionState('connecting');
             input.value = '';
@@ -639,6 +692,9 @@
         errorEl.classList.add('hidden');
 
         try {
+            closePeerConnection(guestPC);
+            guestPC = null;
+            dataChannel = null;
             isGuest = true;
             isHost = false;
 
@@ -656,7 +712,7 @@
                 setupDataChannel(e.channel, false);
             };
 
-            const offer = decode(text);
+            const offer = parseDescription(text, 'offer');
             await guestPC.setRemoteDescription(offer);
 
             const answer = await guestPC.createAnswer();
@@ -683,6 +739,10 @@
 
     function copyJoinAnswer() {
         const text = document.getElementById('p2p-join-answer').textContent;
+        if (!guestPC || !guestPC.localDescription || !text) {
+            showToast('Your response code is still being generated', 'warning');
+            return;
+        }
         navigator.clipboard.writeText(text).then(() => {
             const btn = document.getElementById('p2p-join-copy');
             btn.textContent = 'Copied!';
@@ -773,7 +833,7 @@
     }
 
     function updateGuestDisplay() {
-        const el = document.getElementById('p2p-peer-info');
+        const el = document.getElementById(isHost ? 'p2p-host-guests' : 'p2p-peer-info');
         if (!el || !remoteProfile) return;
         el.innerHTML = `
             <div class="p2p-peer">
@@ -820,6 +880,7 @@
         hostPC = null;
         guestPC = null;
         remoteProfile = null;
+        pendingState = null;
         isHost = false;
         isGuest = false;
         setConnectionState('disconnected');
@@ -828,6 +889,7 @@
 
         document.getElementById('p2p-host-session')?.classList.add('hidden');
         document.getElementById('p2p-host-offer').textContent = 'Generating...';
+        document.getElementById('p2p-host-copy').disabled = true;
         document.getElementById('p2p-host-answer').value = '';
         document.getElementById('p2p-join-offer').value = '';
         document.getElementById('p2p-join-answer').textContent = '';
