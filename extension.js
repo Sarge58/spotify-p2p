@@ -1,11 +1,15 @@
 // SpotifyP2P - Listen Together Extension
 // P2P WebRTC-based real-time sync for Spicetify
 
-(function() {
+(function(root) {
     'use strict';
 
     const EXTENSION_KEY = '__spotifyP2P';
-    window[EXTENSION_KEY]?.dispose?.();
+    const PROTOCOL_VERSION = 1;
+    const isCommonJS = typeof document === 'undefined'
+        && typeof module !== 'undefined'
+        && module.exports;
+    if (!isCommonJS) root[EXTENSION_KEY]?.dispose?.();
 
     const STUN_SERVERS = {
         iceServers: [
@@ -18,6 +22,14 @@
     const HEARTBEAT_INTERVAL = 1000;
     const DISCONNECT_GRACE_PERIOD = 5000;
     const TOAST_DURATION = 3000;
+    const MAX_SIGNAL_LENGTH = 250000;
+    const MAX_DATA_MESSAGE_LENGTH = 32768;
+    const MAX_TRACK_POSITION = 24 * 60 * 60 * 1000;
+    const MAX_PROFILE_NAME_LENGTH = 80;
+    const MAX_METADATA_LENGTH = 500;
+    const CONTROL_COOLDOWN = 150;
+    const SESSION_ID_PATTERN = /^[A-Za-z0-9_-]{22}$/;
+    const ALLOWED_CONTROL_ACTIONS = new Set(['play', 'pause', 'next', 'prev', 'seek']);
 
     let isHost = false;
     let isGuest = false;
@@ -28,11 +40,13 @@
     let guestApproved = false;
     let hostApproved = false;
     let heartbeatInterval = null;
-    let connectionState = 'disconnected';
-    let topbarObserver = null;
+    let topbarButton = null;
     let disconnectTimer = null;
     let applyingState = false;
     let pendingState = null;
+    let sessionVersion = 0;
+    let lastRemoteControlAt = 0;
+    let activeSessionId = null;
 
     // ── Helpers ──
 
@@ -42,12 +56,11 @@
             if (user) {
                 return {
                     name: user.displayName || user.name || 'Unknown',
-                    image: user.image || null,
-                    uri: user.uri || null
+                    image: user.image || null
                 };
             }
         } catch(e) {}
-        return { name: 'Unknown', image: null, uri: null };
+        return { name: 'Unknown', image: null };
     }
 
     function bytesToBase64Url(bytes) {
@@ -65,6 +78,66 @@
         return Uint8Array.from(atob(padded), (character) => character.charCodeAt(0));
     }
 
+    class ProtocolError extends Error {
+        constructor(code, message) {
+            super(message);
+            this.name = 'ProtocolError';
+            this.code = code;
+        }
+    }
+
+    function assertProtocol(condition, code, message) {
+        if (!condition) throw new ProtocolError(code, message);
+    }
+
+    function createSessionId(cryptoApi = globalThis.crypto) {
+        const bytes = new Uint8Array(16);
+        cryptoApi.getRandomValues(bytes);
+        return bytesToBase64Url(bytes);
+    }
+
+    function createSignalEnvelope(description, sessionId) {
+        return {
+            protocol: PROTOCOL_VERSION,
+            sessionId,
+            description
+        };
+    }
+
+    function parseSignalEnvelope(value, expectedType, expectedSessionId = null) {
+        assertProtocol(isRecord(value), 'invalid-signal', 'Invalid signaling envelope');
+        assertProtocol(value.protocol === PROTOCOL_VERSION, 'version-mismatch', 'Incompatible SpotifyP2P protocol');
+        assertProtocol(SESSION_ID_PATTERN.test(value.sessionId), 'invalid-session', 'Invalid session identifier');
+        assertProtocol(expectedSessionId === null || value.sessionId === expectedSessionId,
+            'stale-session', 'This response belongs to another session');
+        assertProtocol(isRecord(value.description)
+            && value.description.type === expectedType
+            && typeof value.description.sdp === 'string',
+        'invalid-description', `Expected a WebRTC ${expectedType} description`);
+
+        return { description: value.description, sessionId: value.sessionId };
+    }
+
+    function createPeerMessage(payload, sessionId) {
+        return {
+            ...payload,
+            protocol: PROTOCOL_VERSION,
+            sessionId
+        };
+    }
+
+    const SIGNAL_ERROR_MESSAGES = Object.freeze({
+        'version-mismatch': 'This code was made by an incompatible SpotifyP2P version.',
+        'stale-session': 'This response belongs to an older or different session.',
+        'invalid-session': 'This code has an invalid session identifier.',
+        'invalid-description': 'This code does not contain the expected connection description.',
+        'invalid-signal': 'This is not a valid SpotifyP2P connection code.'
+    });
+
+    function getSignalErrorMessage(error) {
+        return SIGNAL_ERROR_MESSAGES[error?.code] || 'The connection code is invalid or incomplete.';
+    }
+
     async function encode(obj) {
         const bytes = new TextEncoder().encode(JSON.stringify(obj));
         if (!globalThis.CompressionStream) return `j.${bytesToBase64Url(bytes)}`;
@@ -79,7 +152,33 @@
         }
     }
 
+    async function readTextWithLimit(stream, limit) {
+        const reader = stream.getReader();
+        const decoder = new TextDecoder();
+        let size = 0;
+        let text = '';
+
+        try {
+            while (true) {
+                const { value, done } = await reader.read();
+                if (done) break;
+                size += value.byteLength;
+                if (size > limit) throw new Error('Decompressed signaling code is too large');
+                text += decoder.decode(value, { stream: true });
+            }
+            return text + decoder.decode();
+        } catch (error) {
+            await reader.cancel(error).catch(() => {});
+            throw error;
+        } finally {
+            reader.releaseLock();
+        }
+    }
+
     async function decode(str) {
+        if (typeof str !== 'string' || !str || str.length > MAX_SIGNAL_LENGTH) {
+            throw new Error('Signaling code is empty or too large');
+        }
         // Accept offers from the pre-compression extension as well as new codes.
         if (!str.startsWith('z.') && !str.startsWith('j.')) {
             const binary = atob(str);
@@ -93,13 +192,83 @@
         if (!globalThis.DecompressionStream) throw new Error('This Spotify version cannot read compressed signaling codes');
 
         const decompressed = new Blob([bytes]).stream().pipeThrough(new DecompressionStream('deflate-raw'));
-        return JSON.parse(await new Response(decompressed).text());
+        return JSON.parse(await readTextWithLimit(decompressed, MAX_SIGNAL_LENGTH));
+    }
+
+    function isFinitePosition(value) {
+        return Number.isFinite(value) && value >= 0 && value <= MAX_TRACK_POSITION;
+    }
+
+    function isPlayableSpotifyUri(value) {
+        return typeof value === 'string' && /^spotify:(track|episode):[^\s]{1,500}$/.test(value);
+    }
+
+    function isRecord(value) {
+        return Boolean(value) && typeof value === 'object' && !Array.isArray(value);
+    }
+
+    function validateSyncState(state) {
+        const optionalText = ['name', 'artist', 'image'];
+        const isValid = isRecord(state)
+            && typeof state.playing === 'boolean'
+            && isFinitePosition(state.pos)
+            && (state.uri === null || isPlayableSpotifyUri(state.uri))
+            && Number.isFinite(state.ts)
+            && optionalText.every((key) => state[key] == null
+                || (typeof state[key] === 'string' && state[key].length <= MAX_METADATA_LENGTH));
+
+        return isValid ? {
+            playing: state.playing,
+            pos: state.pos,
+            uri: state.uri,
+            name: state.name ?? null,
+            artist: state.artist ?? null,
+            image: state.image ?? null,
+            ts: state.ts
+        } : null;
+    }
+
+    function validateControlMessage(data) {
+        const isValid = isRecord(data)
+            && ALLOWED_CONTROL_ACTIONS.has(data.action)
+            && (data.action !== 'seek' || isFinitePosition(data.pos));
+        if (!isValid) return null;
+        return data.action === 'seek'
+            ? { type: 'control', action: data.action, pos: data.pos }
+            : { type: 'control', action: data.action };
+    }
+
+    const PEER_MESSAGE_VALIDATORS = Object.freeze({
+        host: Object.freeze({
+            profile: (data) => ({ type: 'profile', profile: normalizeProfile(data.profile) }),
+            control: validateControlMessage,
+            'request-sync': () => ({ type: 'request-sync' })
+        }),
+        guest: Object.freeze({
+            sync: (data) => {
+                const state = validateSyncState(data.state);
+                return state ? { type: 'sync', state } : null;
+            },
+            profile: (data) => ({ type: 'profile', profile: normalizeProfile(data.profile) }),
+            approved: () => ({ type: 'approved' })
+        })
+    });
+
+    function validatePeerMessage(data, recipient, sessionId) {
+        const envelopeIsValid = isRecord(data)
+            && data.protocol === PROTOCOL_VERSION
+            && data.sessionId === sessionId
+            && SESSION_ID_PATTERN.test(data.sessionId)
+            && typeof data.type === 'string';
+        if (!envelopeIsValid) return null;
+        return PEER_MESSAGE_VALIDATORS[recipient]?.[data.type]?.(data) ?? null;
     }
 
     function getPlayerState() {
         const p = Spicetify.Player;
         if (!p) return null;
         const track = p.data?.item;
+        if (track?.uri?.startsWith('spotify:local:')) return null;
         return {
             playing: p.isPlaying(),
             pos: p.getPosition(),
@@ -119,6 +288,7 @@
         }
 
         applyingState = true;
+        const activeVersion = sessionVersion;
         try {
             const p = Spicetify.Player;
             if (!p) return;
@@ -128,10 +298,11 @@
                 await new Promise((resolve) => setTimeout(resolve, 300));
             }
 
-            // Account for the short trip from the host to this peer while the
-            // host is playing, rather than synchronizing to an already-stale position.
-            const elapsed = state.playing && state.ts ? Math.max(0, Date.now() - state.ts) : 0;
-            const targetPosition = state.pos + elapsed;
+            if (activeVersion !== sessionVersion || !isGuest || !hostApproved) return;
+
+            // Do not compare wall-clock timestamps across peers: clocks may be
+            // seconds apart, which is worse than the small direct-channel delay.
+            const targetPosition = state.pos;
             if (Math.abs(p.getPosition() - targetPosition) > DRIFT_THRESHOLD) {
                 p.seek(targetPosition);
             }
@@ -153,8 +324,8 @@
     }
 
     function sendData(data) {
-        if (dataChannel && dataChannel.readyState === 'open') {
-            dataChannel.send(JSON.stringify(data));
+        if (dataChannel?.readyState === 'open' && activeSessionId) {
+            dataChannel.send(JSON.stringify(createPeerMessage(data, activeSessionId)));
         }
     }
 
@@ -202,7 +373,6 @@
     // ── Connection State ──
 
     function setConnectionState(state) {
-        connectionState = state;
         const el = document.getElementById('p2p-connection-dot');
         const label = document.getElementById('p2p-connection-label');
         if (!el || !label) return;
@@ -318,6 +488,18 @@
             .p2p-btn.danger { background: transparent; border: 1px solid #e74c3c; color: #e74c3c; }
             .p2p-btn.danger:hover { background: #e74c3c; color: white; }
             .p2p-btn:disabled { opacity: 0.5; cursor: not-allowed; }
+
+            .p2p-controls {
+                display: grid; grid-template-columns: repeat(5, 1fr); gap: 6px;
+                margin: 12px 0;
+            }
+            .p2p-control-btn {
+                min-width: 0; padding: 10px 4px; border: 1px solid #333;
+                border-radius: 8px; background: #282828; color: white;
+                font-size: 13px; cursor: pointer;
+            }
+            .p2p-control-btn:hover { background: #3e3e3e; }
+            .p2p-control-btn:disabled { opacity: 0.45; cursor: not-allowed; }
 
             .p2p-code {
                 font-size: 14px; font-weight: 500; text-align: center;
@@ -516,6 +698,15 @@
 
                         <div id="p2p-peer-info"></div>
 
+                        <p class="p2p-subtitle">Control host playback</p>
+                        <div id="p2p-guest-controls" class="p2p-controls">
+                            <button class="p2p-control-btn" data-p2p-action="prev" aria-label="Previous track">⏮</button>
+                            <button class="p2p-control-btn" data-p2p-action="seek-back" aria-label="Seek back 15 seconds">−15s</button>
+                            <button class="p2p-control-btn" data-p2p-action="toggle" aria-label="Play or pause">⏯</button>
+                            <button class="p2p-control-btn" data-p2p-action="seek-forward" aria-label="Seek forward 15 seconds">+15s</button>
+                            <button class="p2p-control-btn" data-p2p-action="next" aria-label="Next track">⏭</button>
+                        </div>
+
                         <hr class="p2p-divider">
                         <button id="p2p-sync-btn" class="p2p-btn">Sync Now</button>
                         <button id="p2p-session-reconnect" class="p2p-btn hidden">Reconnect</button>
@@ -528,25 +719,39 @@
         document.body.appendChild(c);
 
         document.getElementById('p2p-close').onclick = togglePanel;
-        document.getElementById('p2p-host-btn').onclick = startHost;
+        document.getElementById('p2p-host-btn').onclick = () => runNewSessionTask(startHost);
         document.getElementById('p2p-join-btn').onclick = showJoinView;
         document.getElementById('p2p-host-copy').onclick = copyHostOffer;
         document.getElementById('p2p-host-accept').onclick = acceptAnswer;
-        document.getElementById('p2p-host-reconnect').onclick = startHost;
+        document.getElementById('p2p-host-reconnect').onclick = () => runNewSessionTask(startHost);
         document.getElementById('p2p-host-leave').onclick = leave;
         document.getElementById('p2p-host-sync').onclick = manualSync;
         document.getElementById('p2p-host-approve').onclick = approveGuest;
         document.getElementById('p2p-host-reject').onclick = rejectGuest;
         document.getElementById('p2p-join-connect').onclick = generateAnswer;
         document.getElementById('p2p-join-copy').onclick = copyJoinAnswer;
-        document.getElementById('p2p-join-back').onclick = showHome;
+        document.getElementById('p2p-join-back').onclick = leave;
         document.getElementById('p2p-sync-btn').onclick = manualSync;
         document.getElementById('p2p-session-reconnect').onclick = beginGuestReconnect;
         document.getElementById('p2p-session-leave').onclick = leave;
+        document.querySelectorAll('[data-p2p-action]').forEach((button) => {
+            button.onclick = () => sendGuestControl(button.dataset.p2pAction);
+        });
+        setGuestControlsEnabled(false);
     }
 
     function togglePanel() {
         document.getElementById('spotify-p2p-panel').classList.toggle('open');
+    }
+
+    function runNewSessionTask(task) {
+        const expectedVersion = sessionVersion + 1;
+        void task().catch((error) => {
+            if (sessionVersion !== expectedVersion) return;
+            console.error('SpotifyP2P: Failed to start session', error);
+            leave();
+            showToast('Could not start the session', 'error');
+        });
     }
 
     function showHome() {
@@ -584,6 +789,43 @@
         if (status) status.textContent = label;
     }
 
+    function setGuestControlsEnabled(enabled) {
+        document.querySelectorAll('[data-p2p-action]').forEach((button) => {
+            button.disabled = !enabled;
+        });
+    }
+
+    function createSeekControl(offset) {
+        const player = Spicetify.Player;
+        const duration = player.getDuration?.();
+        const maximum = Number.isFinite(duration) ? duration : MAX_TRACK_POSITION;
+        return {
+            type: 'control',
+            action: 'seek',
+            pos: Math.max(0, Math.min(maximum, player.getPosition() + offset))
+        };
+    }
+
+    const GUEST_CONTROL_BUILDERS = Object.freeze({
+        toggle: () => ({
+            type: 'control',
+            action: Spicetify.Player.isPlaying() ? 'pause' : 'play'
+        }),
+        'seek-back': () => createSeekControl(-15000),
+        'seek-forward': () => createSeekControl(15000),
+        prev: () => ({ type: 'control', action: 'prev' }),
+        next: () => ({ type: 'control', action: 'next' })
+    });
+
+    function sendGuestControl(action) {
+        if (!isGuest || !hostApproved || dataChannel?.readyState !== 'open') {
+            showToast('Guest controls are unavailable until the host approves you', 'warning');
+            return;
+        }
+        const message = GUEST_CONTROL_BUILDERS[action]?.();
+        if (message) sendData(message);
+    }
+
     function clearDisconnectGracePeriod() {
         if (!disconnectTimer) return;
         clearTimeout(disconnectTimer);
@@ -614,6 +856,7 @@
         showSessionView();
         setGuestConnectionStatus('Disconnected — get a new code from the host', 'disconnected');
         document.getElementById('p2p-sync-btn').disabled = true;
+        setGuestControlsEnabled(false);
         document.getElementById('p2p-session-reconnect').classList.remove('hidden');
     }
 
@@ -670,23 +913,30 @@
         }
     }
 
-    async function parseDescription(text, expectedType) {
-        const description = await decode(text);
-        if (!description || description.type !== expectedType || typeof description.sdp !== 'string') {
-            throw new Error(`Expected a WebRTC ${expectedType} description`);
-        }
-        return description;
+    function resetTransport() {
+        const activeChannel = dataChannel;
+        const activeHostPC = hostPC;
+        const activeGuestPC = guestPC;
+        dataChannel = null;
+        hostPC = null;
+        guestPC = null;
+        lastRemoteControlAt = 0;
+        try { activeChannel?.close(); } catch (error) {}
+        closePeerConnection(activeHostPC);
+        closePeerConnection(activeGuestPC);
+    }
+
+    async function parseSignal(text, expectedType, expectedSessionId = null) {
+        return parseSignalEnvelope(await decode(text), expectedType, expectedSessionId);
     }
 
     // ── Host ──
 
     async function startHost() {
+        const activeVersion = ++sessionVersion;
         clearDisconnectGracePeriod();
-        closePeerConnection(hostPC);
-        closePeerConnection(guestPC);
-        hostPC = null;
-        guestPC = null;
-        dataChannel = null;
+        resetTransport();
+        activeSessionId = createSessionId();
         remoteProfile = null;
         guestApproved = false;
         hostApproved = false;
@@ -703,7 +953,7 @@
 
         hostPC.onicegatheringstatechange = () => {
             if (hostPC === currentHostPC && currentHostPC.iceGatheringState === 'complete') {
-                updateHostOffer();
+                void updateHostOffer().catch((error) => console.error('SpotifyP2P: Failed to update offer', error));
             }
         };
 
@@ -729,26 +979,27 @@
 
         hostPC.ondatachannel = (e) => {
             if (hostPC !== currentHostPC) return;
-            setupDataChannel(e.channel, true);
+            setupDataChannel(e.channel);
         };
 
         // The host must create the channel before the offer; otherwise there is
         // nothing in the SDP to negotiate and no usable code is produced.
-        setupDataChannel(hostPC.createDataChannel('spotify-p2p', { ordered: true }), true);
+        setupDataChannel(hostPC.createDataChannel('spotify-p2p', { ordered: true }));
 
-        const offer = await hostPC.createOffer();
-        await hostPC.setLocalDescription(offer);
+        const offer = await currentHostPC.createOffer();
+        await currentHostPC.setLocalDescription(offer);
 
         showHostView();
         setConnectionState('connecting');
-        await waitForIceGatheringComplete(hostPC);
-        updateHostOffer();
+        await waitForIceGatheringComplete(currentHostPC);
+        if (activeVersion !== sessionVersion || hostPC !== currentHostPC) return;
+        await updateHostOffer();
     }
 
     async function updateHostOffer() {
         if (!hostPC || !hostPC.localDescription) return;
         const peerConnection = hostPC;
-        const encoded = await encode(peerConnection.localDescription);
+        const encoded = await encode(createSignalEnvelope(peerConnection.localDescription, activeSessionId));
         if (hostPC !== peerConnection) return;
         const el = document.getElementById('p2p-host-offer');
         el.textContent = encoded;
@@ -788,8 +1039,10 @@
 
         try {
             if (!hostPC) throw new Error('Host session is no longer active');
-            const answer = await parseDescription(text, 'answer');
-            await hostPC.setRemoteDescription(answer);
+            const currentHostPC = hostPC;
+            const { description: answer } = await parseSignal(text, 'answer', activeSessionId);
+            if (hostPC !== currentHostPC) return;
+            await currentHostPC.setRemoteDescription(answer);
             setConnectionState('connecting');
             input.value = '';
             input.classList.remove('error');
@@ -797,7 +1050,7 @@
             console.error('SpotifyP2P:', err);
             input.classList.add('error');
             setTimeout(() => input.classList.remove('error'), 1500);
-            showToast('Invalid response code', 'error');
+            showToast(getSignalErrorMessage(err), 'error');
         }
     }
 
@@ -814,13 +1067,18 @@
 
         const errorEl = document.getElementById('p2p-join-error');
         const errorText = document.getElementById('p2p-join-error-text');
+        const answerEl = document.getElementById('p2p-join-answer');
+        const copyButton = document.getElementById('p2p-join-copy');
         errorEl.classList.add('hidden');
+        answerEl.textContent = '';
+        answerEl.classList.add('hidden');
+        copyButton.classList.add('hidden');
+        const activeVersion = ++sessionVersion;
 
         try {
             clearDisconnectGracePeriod();
-            closePeerConnection(guestPC);
-            guestPC = null;
-            dataChannel = null;
+            resetTransport();
+            activeSessionId = null;
             isGuest = true;
             isHost = false;
             hostApproved = false;
@@ -847,30 +1105,38 @@
 
             guestPC.ondatachannel = (e) => {
                 if (guestPC !== currentGuestPC) return;
-                setupDataChannel(e.channel, false);
+                setupDataChannel(e.channel);
             };
 
-            const offer = await parseDescription(text, 'offer');
-            await guestPC.setRemoteDescription(offer);
+            const parsedOffer = await parseSignal(text, 'offer');
+            activeSessionId = parsedOffer.sessionId;
+            const offer = parsedOffer.description;
+            await currentGuestPC.setRemoteDescription(offer);
 
-            const answer = await guestPC.createAnswer();
-            await guestPC.setLocalDescription(answer);
+            const answer = await currentGuestPC.createAnswer();
+            await currentGuestPC.setLocalDescription(answer);
 
-            await waitForIceGatheringComplete(guestPC);
+            await waitForIceGatheringComplete(currentGuestPC);
+            if (activeVersion !== sessionVersion || guestPC !== currentGuestPC) return;
 
-            const encoded = await encode(guestPC.localDescription);
-            document.getElementById('p2p-join-answer').textContent = encoded;
-            document.getElementById('p2p-join-answer').classList.remove('hidden');
-            document.getElementById('p2p-join-copy').classList.remove('hidden');
+            const encoded = await encode(createSignalEnvelope(currentGuestPC.localDescription, activeSessionId));
+            answerEl.textContent = encoded;
+            answerEl.classList.remove('hidden');
+            copyButton.classList.remove('hidden');
             input.classList.remove('error');
 
-            document.getElementById('p2p-join-copy').onclick = copyJoinAnswer;
+            copyButton.onclick = copyJoinAnswer;
 
         } catch (err) {
+            if (activeVersion !== sessionVersion) return;
+            resetTransport();
+            activeSessionId = null;
+            isGuest = false;
+            hostApproved = false;
             console.error('SpotifyP2P:', err);
             input.classList.add('error');
             setTimeout(() => input.classList.remove('error'), 1500);
-            errorText.textContent = 'Invalid host code. Make sure you copied the entire code.';
+            errorText.textContent = getSignalErrorMessage(err);
             errorEl.classList.remove('hidden');
         }
     }
@@ -892,7 +1158,13 @@
 
     // ── Data Channel ──
 
-    function setupDataChannel(channel, hostSide) {
+    function setupDataChannel(channel) {
+        const channelIsUnexpected = channel.label !== 'spotify-p2p'
+            || (dataChannel !== null && dataChannel !== channel);
+        if (channelIsUnexpected) {
+            channel.close();
+            return;
+        }
         dataChannel = channel;
 
         channel.onopen = () => {
@@ -915,9 +1187,14 @@
         channel.onmessage = (e) => {
             if (dataChannel !== channel) return;
             try {
+                if (typeof e.data !== 'string' || e.data.length > MAX_DATA_MESSAGE_LENGTH) {
+                    throw new Error('Peer message is empty, binary, or too large');
+                }
                 const data = JSON.parse(e.data);
-                if (isHost) handleHostMessage(data);
-                else handleGuestMessage(data);
+                const validated = validatePeerMessage(data, isHost ? 'host' : 'guest', activeSessionId);
+                if (!validated) throw new Error('Peer message failed validation');
+                if (isHost) handleHostMessage(validated);
+                else handleGuestMessage(validated);
             } catch(err) {
                 console.error('SpotifyP2P: Bad message', err);
             }
@@ -943,52 +1220,67 @@
         };
     }
 
-    function handleHostMessage(data) {
-        switch (data.type) {
-            case 'profile':
-                remoteProfile = normalizeProfile(data.profile);
-                updateGuestDisplay();
-                document.getElementById('p2p-host-approval').classList.remove('hidden');
-                showToast(`${remoteProfile.name} wants to join`, 'info');
-                break;
-            case 'control':
-                if (!guestApproved) return;
-                if (data.action === 'play') Spicetify.Player.play();
-                else if (data.action === 'pause') Spicetify.Player.pause();
-                else if (data.action === 'next') Spicetify.Player.next();
-                else if (data.action === 'prev') Spicetify.Player.back();
-                else if (data.action === 'seek') Spicetify.Player.seek(data.pos);
-                setTimeout(broadcastState, 100);
-                break;
-            case 'request-sync':
-                if (guestApproved) broadcastState();
-                break;
+    const HOST_CONTROL_HANDLERS = Object.freeze({
+        play: () => Spicetify.Player.play(),
+        pause: () => Spicetify.Player.pause(),
+        next: () => Spicetify.Player.next(),
+        prev: () => Spicetify.Player.back(),
+        seek: (data) => {
+            const duration = Spicetify.Player.getDuration?.();
+            Spicetify.Player.seek(Number.isFinite(duration) ? Math.min(data.pos, duration) : data.pos);
         }
+    });
+
+    const HOST_MESSAGE_HANDLERS = Object.freeze({
+        profile: (data) => {
+            if (guestApproved) return;
+            remoteProfile = data.profile;
+            updateGuestDisplay();
+            document.getElementById('p2p-host-approval').classList.remove('hidden');
+            showToast(`${remoteProfile.name} wants to join`, 'info');
+        },
+        control: (data) => {
+            if (!guestApproved) return;
+            const now = performance.now();
+            if (now - lastRemoteControlAt < CONTROL_COOLDOWN) return;
+            lastRemoteControlAt = now;
+            HOST_CONTROL_HANDLERS[data.action](data);
+            setTimeout(broadcastState, 100);
+        },
+        'request-sync': () => guestApproved && broadcastState()
+    });
+
+    const GUEST_MESSAGE_HANDLERS = Object.freeze({
+        sync: (data) => hostApproved && applyState(data.state),
+        profile: (data) => {
+            remoteProfile = data.profile;
+            updateGuestDisplay();
+        },
+        approved: () => {
+            hostApproved = true;
+            setGuestConnectionStatus('Connected to host', 'connected');
+            document.getElementById('p2p-sync-btn').disabled = false;
+            setGuestControlsEnabled(true);
+            showToast('Host approved this session', 'info');
+        }
+    });
+
+    function handleHostMessage(data) {
+        HOST_MESSAGE_HANDLERS[data.type](data);
     }
 
     function handleGuestMessage(data) {
-        switch (data.type) {
-            case 'sync':
-                if (hostApproved) applyState(data.state);
-                break;
-            case 'profile':
-                remoteProfile = normalizeProfile(data.profile);
-                updateGuestDisplay();
-                break;
-            case 'approved':
-                hostApproved = true;
-                setGuestConnectionStatus('Connected to host', 'connected');
-                document.getElementById('p2p-sync-btn').disabled = false;
-                showToast('Host approved this session', 'info');
-                break;
-        }
+        GUEST_MESSAGE_HANDLERS[data.type](data);
     }
 
     function normalizeProfile(profile) {
         return {
-            name: typeof profile?.name === 'string' && profile.name.trim() ? profile.name.slice(0, 80) : 'Unknown',
-            image: typeof profile?.image === 'string' ? profile.image : null,
-            uri: typeof profile?.uri === 'string' ? profile.uri : null
+            name: typeof profile?.name === 'string' && profile.name.trim()
+                ? profile.name.trim().slice(0, MAX_PROFILE_NAME_LENGTH)
+                : 'Unknown',
+            image: typeof profile?.image === 'string' && profile.image.length <= MAX_METADATA_LENGTH
+                ? profile.image
+                : null
         };
     }
 
@@ -1039,14 +1331,11 @@
     // ── Leave ──
 
     function leave() {
+        sessionVersion += 1;
         stopHeartbeat();
         clearDisconnectGracePeriod();
-        if (dataChannel) { try { dataChannel.close(); } catch(e) {} }
-        if (hostPC) { try { hostPC.close(); } catch(e) {} }
-        if (guestPC) { try { guestPC.close(); } catch(e) {} }
-        dataChannel = null;
-        hostPC = null;
-        guestPC = null;
+        resetTransport();
+        activeSessionId = null;
         remoteProfile = null;
         pendingState = null;
         guestApproved = false;
@@ -1070,6 +1359,7 @@
         document.getElementById('p2p-host-approval').classList.add('hidden');
         document.getElementById('p2p-host-sync').disabled = true;
         document.getElementById('p2p-sync-btn').disabled = false;
+        setGuestControlsEnabled(false);
         setGuestConnectionStatus('Connected to host', 'connected');
         document.getElementById('p2p-now-playing').classList.add('hidden');
         document.getElementById('p2p-peer-info').innerHTML = '';
@@ -1077,56 +1367,17 @@
 
     // ── Init ──
 
-    function findWhatsNewButton() {
-        return [...document.querySelectorAll('button')].find((button) => {
-            const accessibleName = [
-                button.getAttribute('aria-label'),
-                button.getAttribute('data-testid'),
-                button.textContent
-            ].filter(Boolean).join(' ').toLowerCase();
-            return /what'?s\s+new|whats\s+new/.test(accessibleName);
-        }) || null;
-    }
-
-    function createTopbarButton(whatsNew) {
-        const button = whatsNew.cloneNode(true);
-        button.id = 'spotify-p2p-topbar-toggle';
-        button.removeAttribute('data-testid');
-        button.removeAttribute('title');
-        button.setAttribute('aria-label', 'SpotifyP2P');
-        button.setAttribute('data-tooltip', 'SpotifyP2P');
-        button.disabled = false;
-        button.querySelectorAll('[id]').forEach((element) => element.removeAttribute('id'));
-        button.innerHTML = '<svg viewBox="0 0 24 24" width="16" height="16" fill="currentColor" aria-hidden="true"><path d="M12 3v10.55c-.59-.34-1.27-.55-2-.55-2.21 0-4 1.79-4 4s1.79 4 4 4 4-1.79 4-4V7h4V3h-6z"/></svg>';
-        button.addEventListener('click', togglePanel);
-        return button;
-    }
-
-    function placeBeforeWhatsNew() {
-        const whatsNew = findWhatsNewButton();
-        if (!whatsNew) return false;
-
-        const parent = whatsNew.parentElement;
-        if (!parent) return false;
-
-        const button = document.getElementById('spotify-p2p-topbar-toggle') || createTopbarButton(whatsNew);
-        if (button.parentElement === parent && button.nextElementSibling === whatsNew) return true;
-        parent.insertBefore(button, whatsNew);
-        return true;
-    }
-
-    function keepButtonBesideWhatsNew() {
-        placeBeforeWhatsNew();
-        topbarObserver?.disconnect();
-        topbarObserver = new MutationObserver(() => placeBeforeWhatsNew());
-        topbarObserver.observe(document.body, { childList: true, subtree: true });
+    function mountTopbarButton() {
+        const icon = '<svg viewBox="0 0 24 24" fill="currentColor" aria-hidden="true"><path d="M12 3v10.55c-.59-.34-1.27-.55-2-.55-2.21 0-4 1.79-4 4s1.79 4 4 4 4-1.79 4-4V7h4V3h-6z"/></svg>';
+        topbarButton = new Spicetify.Topbar.Button('SpotifyP2P', icon, togglePanel, false, true);
+        topbarButton.element.id = 'spotify-p2p-topbar-toggle';
     }
 
     function dispose() {
         leave();
-        topbarObserver?.disconnect();
-        topbarObserver = null;
-        document.getElementById('spotify-p2p-topbar-toggle')?.remove();
+        topbarButton?.tippy?.destroy?.();
+        topbarButton?.element?.remove();
+        topbarButton = null;
         document.getElementById('spotify-p2p-container')?.remove();
         document.getElementById('spotify-p2p-styles')?.remove();
         document.getElementById('spotify-p2p-fallback-toggle')?.remove();
@@ -1136,7 +1387,7 @@
     function waitForSpicetify() {
         return new Promise((resolve) => {
             const check = () => {
-                if (Spicetify?.Player && Spicetify?.Platform) resolve();
+                if (globalThis.Spicetify?.Player && globalThis.Spicetify?.Platform && globalThis.Spicetify?.Topbar) resolve();
                 else setTimeout(check, 100);
             };
             check();
@@ -1148,12 +1399,33 @@
         loadStyles();
         createUI();
 
-        keepButtonBesideWhatsNew();
-        console.log('SpotifyP2P: native What\'s New-adjacent button added');
+        mountTopbarButton();
+        console.log('SpotifyP2P: topbar button added');
 
         console.log('SpotifyP2P: Extension loaded');
     }
 
-    window[EXTENSION_KEY] = { dispose };
-    init();
-})();
+    if (isCommonJS) {
+        module.exports = {
+            PROTOCOL_VERSION,
+            ProtocolError,
+            createPeerMessage,
+            createSessionId,
+            createSignalEnvelope,
+            decode,
+            encode,
+            getSignalErrorMessage,
+            isFinitePosition,
+            isPlayableSpotifyUri,
+            normalizeProfile,
+            parseSignalEnvelope,
+            validateControlMessage,
+            validatePeerMessage,
+            validateSyncState
+        };
+        return;
+    }
+
+    root[EXTENSION_KEY] = { dispose };
+    void init().catch((error) => console.error('SpotifyP2P: Extension failed to initialize', error));
+})(typeof window !== 'undefined' ? window : globalThis);

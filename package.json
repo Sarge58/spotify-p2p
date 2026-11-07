@@ -1,0 +1,12 @@
+{
+  "name": "spotify-p2p",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Protocol regression tests for the SpotifyP2P Spicetify extension",
+  "scripts": {
+    "test": "node test/protocol.test.js && node test/session.integration.test.js"
+  },
+  "engines": {
+    "node": ">=18"
+  }
+}
