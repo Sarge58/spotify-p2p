@@ -28,6 +28,9 @@
     const MAX_PROFILE_NAME_LENGTH = 80;
     const MAX_METADATA_LENGTH = 500;
     const CONTROL_COOLDOWN = 150;
+    const CONNECTION_NOTICE_DELAY = 30000;
+    const APPROVAL_NOTICE_DELAY = 45000;
+    const PLAYBACK_RETRY_DELAY = 30000;
     const SESSION_ID_PATTERN = /^[A-Za-z0-9_-]{22}$/;
     const ALLOWED_CONTROL_ACTIONS = new Set(['play', 'pause', 'next', 'prev', 'seek']);
 
@@ -44,23 +47,48 @@
     let disconnectTimer = null;
     let applyingState = false;
     let pendingState = null;
-    let sessionVersion = 0;
+    const sessionTracker = createSessionTracker();
+    const noticeTimers = createTimerRegistry();
     let lastRemoteControlAt = 0;
     let activeSessionId = null;
+    let blockedPlaybackUri = null;
+    let blockedPlaybackUntil = 0;
 
     // ── Helpers ──
 
     function getProfile() {
-        try {
-            const user = Spicetify.Platform?.User || Spicetify.User;
-            if (user) {
-                return {
-                    name: user.displayName || user.name || 'Unknown',
-                    image: user.image || null
-                };
+        return { name: isHost ? 'Host' : 'Guest', image: null };
+    }
+
+    function createSessionTracker() {
+        let current = 0;
+        return Object.freeze({
+            begin: () => ++current,
+            invalidate: () => ++current,
+            isCurrent: (version) => current === version,
+            next: () => current + 1,
+            value: () => current
+        });
+    }
+
+    function createTimerRegistry(scheduler = globalThis) {
+        const timers = new Map();
+        const clear = (name) => {
+            const timer = timers.get(name);
+            if (timer !== undefined) scheduler.clearTimeout(timer);
+            timers.delete(name);
+        };
+        return Object.freeze({
+            clear,
+            clearAll: () => [...timers.keys()].forEach(clear),
+            schedule: (name, delay, callback) => {
+                clear(name);
+                timers.set(name, scheduler.setTimeout(() => {
+                    timers.delete(name);
+                    callback();
+                }, delay));
             }
-        } catch(e) {}
-        return { name: 'Unknown', image: null };
+        });
     }
 
     function bytesToBase64Url(bytes) {
@@ -271,7 +299,7 @@
         if (track?.uri?.startsWith('spotify:local:')) return null;
         return {
             playing: p.isPlaying(),
-            pos: p.getPosition(),
+            pos: p.getProgress(),
             uri: track?.uri || null,
             name: track?.name || null,
             artist: track?.artists?.map(a => a.name).join(', ') || null,
@@ -288,22 +316,25 @@
         }
 
         applyingState = true;
-        const activeVersion = sessionVersion;
+        const activeVersion = sessionTracker.value();
         try {
             const p = Spicetify.Player;
             if (!p) return;
 
+            if (state.uri === blockedPlaybackUri && Date.now() < blockedPlaybackUntil) return;
             if (state.uri && p.data?.item?.uri !== state.uri) {
                 await p.playUri(state.uri);
+                blockedPlaybackUri = null;
+                blockedPlaybackUntil = 0;
                 await new Promise((resolve) => setTimeout(resolve, 300));
             }
 
-            if (activeVersion !== sessionVersion || !isGuest || !hostApproved) return;
+            if (!sessionTracker.isCurrent(activeVersion) || !isGuest || !hostApproved) return;
 
             // Do not compare wall-clock timestamps across peers: clocks may be
             // seconds apart, which is worse than the small direct-channel delay.
             const targetPosition = state.pos;
-            if (Math.abs(p.getPosition() - targetPosition) > DRIFT_THRESHOLD) {
+            if (Math.abs(p.getProgress() - targetPosition) > DRIFT_THRESHOLD) {
                 p.seek(targetPosition);
             }
 
@@ -313,6 +344,9 @@
             updateNowPlaying(state);
         } catch (error) {
             console.error('SpotifyP2P: Failed to apply playback state', error);
+            blockedPlaybackUri = state.uri || blockedPlaybackUri;
+            blockedPlaybackUntil = Date.now() + PLAYBACK_RETRY_DELAY;
+            showToast('The host track may be unavailable on this Spotify account', 'error');
         } finally {
             applyingState = false;
             if (pendingState) {
@@ -745,9 +779,9 @@
     }
 
     function runNewSessionTask(task) {
-        const expectedVersion = sessionVersion + 1;
+        const expectedVersion = sessionTracker.next();
         void task().catch((error) => {
-            if (sessionVersion !== expectedVersion) return;
+            if (!sessionTracker.isCurrent(expectedVersion)) return;
             console.error('SpotifyP2P: Failed to start session', error);
             leave();
             showToast('Could not start the session', 'error');
@@ -802,7 +836,7 @@
         return {
             type: 'control',
             action: 'seek',
-            pos: Math.max(0, Math.min(maximum, player.getPosition() + offset))
+            pos: Math.max(0, Math.min(maximum, player.getProgress() + offset))
         };
     }
 
@@ -890,19 +924,19 @@
     function waitForIceGatheringComplete(peerConnection, timeout = 10000) {
         return new Promise((resolve) => {
             if (peerConnection.iceGatheringState === 'complete') {
-                resolve();
+                resolve(true);
                 return;
             }
 
-            const finish = () => {
+            const finish = (complete) => {
                 clearTimeout(timer);
                 peerConnection.removeEventListener('icegatheringstatechange', check);
-                resolve();
+                resolve(complete);
             };
             const check = () => {
-                if (peerConnection.iceGatheringState === 'complete') finish();
+                if (peerConnection.iceGatheringState === 'complete') finish(true);
             };
-            const timer = setTimeout(finish, timeout);
+            const timer = setTimeout(() => finish(false), timeout);
             peerConnection.addEventListener('icegatheringstatechange', check);
         });
     }
@@ -921,6 +955,7 @@
         hostPC = null;
         guestPC = null;
         lastRemoteControlAt = 0;
+        noticeTimers.clearAll();
         try { activeChannel?.close(); } catch (error) {}
         closePeerConnection(activeHostPC);
         closePeerConnection(activeGuestPC);
@@ -933,7 +968,7 @@
     // ── Host ──
 
     async function startHost() {
-        const activeVersion = ++sessionVersion;
+        const activeVersion = sessionTracker.begin();
         clearDisconnectGracePeriod();
         resetTransport();
         activeSessionId = createSessionId();
@@ -991,8 +1026,9 @@
 
         showHostView();
         setConnectionState('connecting');
-        await waitForIceGatheringComplete(currentHostPC);
-        if (activeVersion !== sessionVersion || hostPC !== currentHostPC) return;
+        const iceComplete = await waitForIceGatheringComplete(currentHostPC);
+        if (!sessionTracker.isCurrent(activeVersion) || hostPC !== currentHostPC) return;
+        if (!iceComplete) showToast('Connection discovery timed out; this code may not work', 'warning');
         await updateHostOffer();
     }
 
@@ -1044,6 +1080,9 @@
             if (hostPC !== currentHostPC) return;
             await currentHostPC.setRemoteDescription(answer);
             setConnectionState('connecting');
+            noticeTimers.schedule('connection', CONNECTION_NOTICE_DELAY, () => {
+                showToast('Still connecting — a firewall or NAT may be blocking WebRTC', 'warning');
+            });
             input.value = '';
             input.classList.remove('error');
         } catch (err) {
@@ -1073,7 +1112,7 @@
         answerEl.textContent = '';
         answerEl.classList.add('hidden');
         copyButton.classList.add('hidden');
-        const activeVersion = ++sessionVersion;
+        const activeVersion = sessionTracker.begin();
 
         try {
             clearDisconnectGracePeriod();
@@ -1116,8 +1155,9 @@
             const answer = await currentGuestPC.createAnswer();
             await currentGuestPC.setLocalDescription(answer);
 
-            await waitForIceGatheringComplete(currentGuestPC);
-            if (activeVersion !== sessionVersion || guestPC !== currentGuestPC) return;
+            const iceComplete = await waitForIceGatheringComplete(currentGuestPC);
+            if (!sessionTracker.isCurrent(activeVersion) || guestPC !== currentGuestPC) return;
+            if (!iceComplete) showToast('Connection discovery timed out; this response may not work', 'warning');
 
             const encoded = await encode(createSignalEnvelope(currentGuestPC.localDescription, activeSessionId));
             answerEl.textContent = encoded;
@@ -1126,9 +1166,12 @@
             input.classList.remove('error');
 
             copyButton.onclick = copyJoinAnswer;
+            noticeTimers.schedule('connection', CONNECTION_NOTICE_DELAY, () => {
+                showToast('Still waiting — confirm the host accepted your latest response code', 'warning');
+            });
 
         } catch (err) {
-            if (activeVersion !== sessionVersion) return;
+            if (!sessionTracker.isCurrent(activeVersion)) return;
             resetTransport();
             activeSessionId = null;
             isGuest = false;
@@ -1170,6 +1213,7 @@
         channel.onopen = () => {
             if (dataChannel !== channel) return;
             clearDisconnectGracePeriod();
+            noticeTimers.clear('connection');
             console.log('SpotifyP2P: Channel open');
 
             if (isHost) {
@@ -1181,6 +1225,9 @@
                 setGuestConnectionStatus('Waiting for host approval', 'connecting');
                 document.getElementById('p2p-sync-btn').disabled = true;
                 document.getElementById('p2p-session-reconnect').classList.add('hidden');
+                noticeTimers.schedule('approval', APPROVAL_NOTICE_DELAY, () => {
+                    setGuestConnectionStatus('Connected — still waiting for host approval', 'connecting');
+                });
             }
         };
 
@@ -1258,6 +1305,7 @@
         },
         approved: () => {
             hostApproved = true;
+            noticeTimers.clear('approval');
             setGuestConnectionStatus('Connected to host', 'connected');
             document.getElementById('p2p-sync-btn').disabled = false;
             setGuestControlsEnabled(true);
@@ -1331,11 +1379,13 @@
     // ── Leave ──
 
     function leave() {
-        sessionVersion += 1;
+        sessionTracker.invalidate();
         stopHeartbeat();
         clearDisconnectGracePeriod();
         resetTransport();
         activeSessionId = null;
+        blockedPlaybackUri = null;
+        blockedPlaybackUntil = 0;
         remoteProfile = null;
         pendingState = null;
         guestApproved = false;
@@ -1410,6 +1460,8 @@
             PROTOCOL_VERSION,
             ProtocolError,
             createPeerMessage,
+            createSessionTracker,
+            createTimerRegistry,
             createSessionId,
             createSignalEnvelope,
             decode,

@@ -1,5 +1,7 @@
 # SpotifyP2P
 
+[![Tests](https://github.com/Sarge58/spotify-p2p/actions/workflows/test.yml/badge.svg)](https://github.com/Sarge58/spotify-p2p/actions/workflows/test.yml)
+
 Listen to Spotify with a friend in sync, directly from the Spotify desktop app.
 
 SpotifyP2P is a [Spicetify](https://spicetify.app/) extension that uses WebRTC to create a direct peer-to-peer connection. The host controls playback and broadcasts playback state so guests stay aligned.
@@ -44,7 +46,7 @@ Once Marketplace has indexed this repository, search for **SpotifyP2P** and inst
 2. One person selects **Host Session**, then copies the generated offer code.
 3. The guest pastes that offer into **Join Session**, generates a response, and sends the response back.
 4. The host pastes the response and accepts it. The session starts when the connection status becomes connected.
-5. The host reviews the joining profile and clicks **Approve Guest** before playback state or the guest's session-panel controls are enabled.
+5. The host reviews the join request and clicks **Approve Guest** before playback state or the guest's session-panel controls are enabled.
 
 ## Notes and limitations
 
@@ -54,7 +56,7 @@ Once Marketplace has indexed this repository, search for **SpotifyP2P** and inst
 - Sessions currently support one host and one guest. Adding more guests requires a separate peer connection per guest or a relay architecture.
 - Google public STUN servers help peers find each other. The extension does not host or proxy your Spotify credentials or audio.
 - Direct WebRTC connections reveal connection metadata, which can include network IP addresses, to the invited peer. Only exchange codes with someone you trust.
-- Display names and avatars arrive from the peer and are not cryptographically verified. Do not treat the displayed profile as proof of identity.
+- Peer labels are generic and are not proof of identity. Only approve the person with whom you exchanged the current session code.
 - This is playback synchronization, not shared audio streaming.
 - Treat an offer/answer code as a one-time invite. The host must explicitly approve each connected guest before sharing playback state.
 - Connection codes are version-specific. Clients running incompatible SpotifyP2P protocol versions will need to update before connecting.
@@ -68,6 +70,8 @@ npm test
 ```
 
 The test suite includes protocol unit tests and an in-memory two-peer integration flow covering signaling, approval, synchronization, controls, stale sessions, and incompatible versions. It does not replace testing against two current Spotify desktop clients with Spicetify installed.
+
+GitHub Actions runs the same suite automatically for pushes to `main` and for pull requests.
 
 ## Troubleshooting
 
