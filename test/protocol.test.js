@@ -6,6 +6,8 @@ const assert = require('node:assert/strict');
 const {
     PROTOCOL_VERSION,
     createPeerMessage,
+    createSessionTracker,
+    createTimerRegistry,
     createSessionId,
     createSignalEnvelope,
     decode,
@@ -52,6 +54,40 @@ test('session identifiers are random base64url values', () => {
     const second = createSessionId();
     assert.match(first, /^[A-Za-z0-9_-]{22}$/);
     assert.notEqual(first, second);
+});
+
+test('session tracker invalidates stale asynchronous work', () => {
+    const tracker = createSessionTracker();
+    const first = tracker.begin();
+    const second = tracker.begin();
+    assert.equal(tracker.isCurrent(first), false);
+    assert.equal(tracker.isCurrent(second), true);
+    tracker.invalidate();
+    assert.equal(tracker.isCurrent(second), false);
+});
+
+test('timer registry replaces and clears lifecycle notices', () => {
+    let nextId = 0;
+    const scheduled = new Map();
+    const cleared = [];
+    const scheduler = {
+        setTimeout(callback) {
+            const id = ++nextId;
+            scheduled.set(id, callback);
+            return id;
+        },
+        clearTimeout(id) {
+            cleared.push(id);
+            scheduled.delete(id);
+        }
+    };
+    const timers = createTimerRegistry(scheduler);
+    timers.schedule('connection', 100, () => {});
+    timers.schedule('connection', 100, () => {});
+    assert.deepEqual(cleared, [1]);
+    timers.clearAll();
+    assert.deepEqual(cleared, [1, 2]);
+    assert.equal(scheduled.size, 0);
 });
 
 test('signaling rejects incompatible versions and stale responses', () => {
