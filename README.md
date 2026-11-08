@@ -6,14 +6,14 @@ Listen to Spotify with a friend in sync, directly from the Spotify desktop app.
 
 SpotifyP2P is a [Spicetify](https://spicetify.app/) extension that uses WebRTC to create a direct peer-to-peer connection. The host controls playback and broadcasts playback state so guests stay aligned.
 
-![SpotifyP2P preview](assets/preview.svg)
+![SpotifyP2P host and guest connected through direct WebRTC](assets/preview.png)
 
 ## What it does
 
 - Adds a native SpotifyP2P button to Spotify's top bar.
 - Connects two Spotify desktop clients with WebRTC and public STUN servers.
 - Synchronizes play, pause, track changes, seek position, and periodic host-state heartbeats.
-- Lets an approved guest request previous/next, play/pause, and 15-second seeks from the session panel.
+- Lets an approved guest control the host through Spotify's native track, play/pause, and seek controls.
 - Provides manual re-sync and automatic correction when playback drifts.
 - Keeps session signaling manual: exchange the generated offer and answer codes with your friend.
 - Binds signaling and data messages to a random session identifier and protocol version.
@@ -24,21 +24,49 @@ SpotifyP2P is a [Spicetify](https://spicetify.app/) extension that uses WebRTC t
 
 Once Marketplace has indexed this repository, search for **SpotifyP2P** and install it from the Extensions tab.
 
-### Manual installation
+### Manual install or update
 
-1. Download [extension.js](extension.js).
-2. Copy it into your Spicetify Extensions folder:
+The commands below download the newest `extension.js` from this repository, install it as `spotify-p2p.js`, enable it in Spicetify, and reapply Spicetify. They work for both a first installation and later updates.
 
-   ```text
-   ~/.config/spicetify/Extensions/
-   ```
+Use the copy button in the upper-right corner of the code block for your operating system, paste the command into the named terminal, and press Enter.
 
-3. Apply it:
+#### Linux
 
-   ```bash
-   spicetify config extensions extension.js
-   spicetify apply
-   ```
+Open a terminal and run:
+
+```bash
+config_dir="$(dirname "$(spicetify -c)")" && \
+temp_file="$(mktemp)" && \
+mkdir -p "$config_dir/Extensions" && \
+curl -fL --retry 3 "https://raw.githubusercontent.com/Sarge58/spotify-p2p/main/extension.js" -o "$temp_file" && \
+install -m 644 "$temp_file" "$config_dir/Extensions/spotify-p2p.js" && \
+rm -f "$temp_file" && \
+spicetify config extensions spotify-p2p.js && \
+spicetify apply
+```
+
+#### Windows
+
+Open **PowerShell** and run:
+
+```powershell
+$ErrorActionPreference = "Stop"
+$configDir = Split-Path -Parent (spicetify -c)
+$extensionsDir = Join-Path $configDir "Extensions"
+$destination = Join-Path $extensionsDir "spotify-p2p.js"
+$tempFile = New-TemporaryFile
+New-Item -ItemType Directory -Force -Path $extensionsDir | Out-Null
+try {
+    Invoke-WebRequest "https://raw.githubusercontent.com/Sarge58/spotify-p2p/main/extension.js" -OutFile $tempFile.FullName
+    Move-Item -Force $tempFile.FullName $destination
+    spicetify config extensions spotify-p2p.js
+    spicetify apply
+} finally {
+    Remove-Item $tempFile.FullName -Force -ErrorAction SilentlyContinue
+}
+```
+
+The download comes from the `main` branch, so it installs the latest version published there rather than unpublished local changes.
 
 ## Start a session
 
@@ -46,7 +74,7 @@ Once Marketplace has indexed this repository, search for **SpotifyP2P** and inst
 2. One person selects **Host Session**, then copies the generated offer code.
 3. The guest pastes that offer into **Join Session**, generates a response, and sends the response back.
 4. The host pastes the response and accepts it. The session starts when the connection status becomes connected.
-5. The host reviews the join request and clicks **Approve Guest** before playback state or the guest's session-panel controls are enabled.
+5. The host reviews the join request and clicks **Approve Guest** before playback state or the guest's native Spotify controls are shared.
 
 ## Notes and limitations
 

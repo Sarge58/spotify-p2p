@@ -32,7 +32,14 @@
     const APPROVAL_NOTICE_DELAY = 45000;
     const PLAYBACK_RETRY_DELAY = 30000;
     const SESSION_ID_PATTERN = /^[A-Za-z0-9_-]{22}$/;
-    const ALLOWED_CONTROL_ACTIONS = new Set(['play', 'pause', 'next', 'prev', 'seek']);
+    const CONTROL_PAYLOAD_NORMALIZERS = Object.freeze({
+        play: () => ({}),
+        pause: () => ({}),
+        next: () => ({}),
+        prev: () => ({}),
+        seek: (data) => isFinitePosition(data.pos) ? { pos: data.pos } : null,
+        'play-uri': (data) => isPlayableSpotifyUri(data.uri) ? { uri: data.uri } : null
+    });
 
     let isHost = false;
     let isGuest = false;
@@ -47,6 +54,8 @@
     let disconnectTimer = null;
     let applyingState = false;
     let pendingState = null;
+    let guestProgressSample = null;
+    let suppressGuestPlaybackUntil = 0;
     const sessionTracker = createSessionTracker();
     const noticeTimers = createTimerRegistry();
     let lastRemoteControlAt = 0;
@@ -257,13 +266,9 @@
     }
 
     function validateControlMessage(data) {
-        const isValid = isRecord(data)
-            && ALLOWED_CONTROL_ACTIONS.has(data.action)
-            && (data.action !== 'seek' || isFinitePosition(data.pos));
-        if (!isValid) return null;
-        return data.action === 'seek'
-            ? { type: 'control', action: data.action, pos: data.pos }
-            : { type: 'control', action: data.action };
+        if (!isRecord(data)) return null;
+        const payload = CONTROL_PAYLOAD_NORMALIZERS[data.action]?.(data);
+        return payload ? { type: 'control', action: data.action, ...payload } : null;
     }
 
     const PEER_MESSAGE_VALIDATORS = Object.freeze({
@@ -316,6 +321,7 @@
         }
 
         applyingState = true;
+        suppressGuestPlaybackUntil = performance.now() + 1000;
         const activeVersion = sessionTracker.value();
         try {
             const p = Spicetify.Player;
@@ -523,18 +529,6 @@
             .p2p-btn.danger:hover { background: #e74c3c; color: white; }
             .p2p-btn:disabled { opacity: 0.5; cursor: not-allowed; }
 
-            .p2p-controls {
-                display: grid; grid-template-columns: repeat(5, 1fr); gap: 6px;
-                margin: 12px 0;
-            }
-            .p2p-control-btn {
-                min-width: 0; padding: 10px 4px; border: 1px solid #333;
-                border-radius: 8px; background: #282828; color: white;
-                font-size: 13px; cursor: pointer;
-            }
-            .p2p-control-btn:hover { background: #3e3e3e; }
-            .p2p-control-btn:disabled { opacity: 0.45; cursor: not-allowed; }
-
             .p2p-code {
                 font-size: 14px; font-weight: 500; text-align: center;
                 padding: 16px; background: #1a1a1a; border: 1px solid #333;
@@ -732,15 +726,6 @@
 
                         <div id="p2p-peer-info"></div>
 
-                        <p class="p2p-subtitle">Control host playback</p>
-                        <div id="p2p-guest-controls" class="p2p-controls">
-                            <button class="p2p-control-btn" data-p2p-action="prev" aria-label="Previous track">⏮</button>
-                            <button class="p2p-control-btn" data-p2p-action="seek-back" aria-label="Seek back 15 seconds">−15s</button>
-                            <button class="p2p-control-btn" data-p2p-action="toggle" aria-label="Play or pause">⏯</button>
-                            <button class="p2p-control-btn" data-p2p-action="seek-forward" aria-label="Seek forward 15 seconds">+15s</button>
-                            <button class="p2p-control-btn" data-p2p-action="next" aria-label="Next track">⏭</button>
-                        </div>
-
                         <hr class="p2p-divider">
                         <button id="p2p-sync-btn" class="p2p-btn">Sync Now</button>
                         <button id="p2p-session-reconnect" class="p2p-btn hidden">Reconnect</button>
@@ -768,10 +753,6 @@
         document.getElementById('p2p-sync-btn').onclick = manualSync;
         document.getElementById('p2p-session-reconnect').onclick = beginGuestReconnect;
         document.getElementById('p2p-session-leave').onclick = leave;
-        document.querySelectorAll('[data-p2p-action]').forEach((button) => {
-            button.onclick = () => sendGuestControl(button.dataset.p2pAction);
-        });
-        setGuestControlsEnabled(false);
     }
 
     function togglePanel() {
@@ -823,41 +804,43 @@
         if (status) status.textContent = label;
     }
 
-    function setGuestControlsEnabled(enabled) {
-        document.querySelectorAll('[data-p2p-action]').forEach((button) => {
-            button.disabled = !enabled;
+    function canRequestNativePlayback() {
+        return isGuest
+            && hostApproved
+            && !applyingState
+            && performance.now() >= suppressGuestPlaybackUntil
+            && dataChannel?.readyState === 'open';
+    }
+
+    function requestGuestTrack() {
+        guestProgressSample = null;
+        const state = getPlayerState();
+        if (!canRequestNativePlayback() || !state?.uri) return;
+        sendData({ type: 'control', action: 'play-uri', uri: state.uri });
+        suppressGuestPlaybackUntil = performance.now() + 500;
+        showToast('Requested track from host', 'info');
+    }
+
+    function requestGuestPlayPause() {
+        if (!canRequestNativePlayback()) return;
+        sendData({
+            type: 'control',
+            action: Spicetify.Player.isPlaying() ? 'play' : 'pause'
         });
     }
 
-    function createSeekControl(offset) {
-        const player = Spicetify.Player;
-        const duration = player.getDuration?.();
-        const maximum = Number.isFinite(duration) ? duration : MAX_TRACK_POSITION;
-        return {
-            type: 'control',
-            action: 'seek',
-            pos: Math.max(0, Math.min(maximum, player.getProgress() + offset))
-        };
-    }
+    function requestGuestSeek(event) {
+        const position = Number(event?.data);
+        const now = performance.now();
+        const previous = guestProgressSample;
+        guestProgressSample = isFinitePosition(position)
+            ? { position, at: now, playing: Spicetify.Player.isPlaying() }
+            : null;
+        if (!previous || !guestProgressSample || !canRequestNativePlayback()) return;
 
-    const GUEST_CONTROL_BUILDERS = Object.freeze({
-        toggle: () => ({
-            type: 'control',
-            action: Spicetify.Player.isPlaying() ? 'pause' : 'play'
-        }),
-        'seek-back': () => createSeekControl(-15000),
-        'seek-forward': () => createSeekControl(15000),
-        prev: () => ({ type: 'control', action: 'prev' }),
-        next: () => ({ type: 'control', action: 'next' })
-    });
-
-    function sendGuestControl(action) {
-        if (!isGuest || !hostApproved || dataChannel?.readyState !== 'open') {
-            showToast('Guest controls are unavailable until the host approves you', 'warning');
-            return;
-        }
-        const message = GUEST_CONTROL_BUILDERS[action]?.();
-        if (message) sendData(message);
+        const expected = previous.position + (previous.playing ? now - previous.at : 0);
+        if (Math.abs(position - expected) < 2000) return;
+        sendData({ type: 'control', action: 'seek', pos: position });
     }
 
     function clearDisconnectGracePeriod() {
@@ -890,7 +873,6 @@
         showSessionView();
         setGuestConnectionStatus('Disconnected — get a new code from the host', 'disconnected');
         document.getElementById('p2p-sync-btn').disabled = true;
-        setGuestControlsEnabled(false);
         document.getElementById('p2p-session-reconnect').classList.remove('hidden');
     }
 
@@ -1272,11 +1254,17 @@
         pause: () => Spicetify.Player.pause(),
         next: () => Spicetify.Player.next(),
         prev: () => Spicetify.Player.back(),
+        'play-uri': (data) => Spicetify.Player.playUri(data.uri),
         seek: (data) => {
             const duration = Spicetify.Player.getDuration?.();
             Spicetify.Player.seek(Number.isFinite(duration) ? Math.min(data.pos, duration) : data.pos);
         }
     });
+
+    async function applyHostControl(data) {
+        await HOST_CONTROL_HANDLERS[data.action](data);
+        setTimeout(broadcastState, 100);
+    }
 
     const HOST_MESSAGE_HANDLERS = Object.freeze({
         profile: (data) => {
@@ -1291,8 +1279,9 @@
             const now = performance.now();
             if (now - lastRemoteControlAt < CONTROL_COOLDOWN) return;
             lastRemoteControlAt = now;
-            HOST_CONTROL_HANDLERS[data.action](data);
-            setTimeout(broadcastState, 100);
+            void applyHostControl(data).catch((error) => {
+                console.error('SpotifyP2P: Guest control failed', error);
+            });
         },
         'request-sync': () => guestApproved && broadcastState()
     });
@@ -1308,7 +1297,6 @@
             noticeTimers.clear('approval');
             setGuestConnectionStatus('Connected to host', 'connected');
             document.getElementById('p2p-sync-btn').disabled = false;
-            setGuestControlsEnabled(true);
             showToast('Host approved this session', 'info');
         }
     });
@@ -1386,6 +1374,8 @@
         activeSessionId = null;
         blockedPlaybackUri = null;
         blockedPlaybackUntil = 0;
+        guestProgressSample = null;
+        suppressGuestPlaybackUntil = 0;
         remoteProfile = null;
         pendingState = null;
         guestApproved = false;
@@ -1409,7 +1399,6 @@
         document.getElementById('p2p-host-approval').classList.add('hidden');
         document.getElementById('p2p-host-sync').disabled = true;
         document.getElementById('p2p-sync-btn').disabled = false;
-        setGuestControlsEnabled(false);
         setGuestConnectionStatus('Connected to host', 'connected');
         document.getElementById('p2p-now-playing').classList.add('hidden');
         document.getElementById('p2p-peer-info').innerHTML = '';
@@ -1424,6 +1413,9 @@
     }
 
     function dispose() {
+        Spicetify.Player.removeEventListener('songchange', requestGuestTrack);
+        Spicetify.Player.removeEventListener('onplaypause', requestGuestPlayPause);
+        Spicetify.Player.removeEventListener('onprogress', requestGuestSeek);
         leave();
         topbarButton?.tippy?.destroy?.();
         topbarButton?.element?.remove();
@@ -1450,6 +1442,9 @@
         createUI();
 
         mountTopbarButton();
+        Spicetify.Player.addEventListener('songchange', requestGuestTrack);
+        Spicetify.Player.addEventListener('onplaypause', requestGuestPlayPause);
+        Spicetify.Player.addEventListener('onprogress', requestGuestSeek);
         console.log('SpotifyP2P: topbar button added');
 
         console.log('SpotifyP2P: Extension loaded');
