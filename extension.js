@@ -5,7 +5,7 @@
     'use strict';
 
     const EXTENSION_KEY = '__spotifyP2P';
-    const PROTOCOL_VERSION = 1;
+    const PROTOCOL_VERSION = 2;
     const isCommonJS = typeof document === 'undefined'
         && typeof module !== 'undefined'
         && module.exports;
@@ -28,9 +28,13 @@
     const MAX_PROFILE_NAME_LENGTH = 80;
     const MAX_METADATA_LENGTH = 500;
     const CONTROL_COOLDOWN = 150;
+    const HOST_CONTROL_SYNC_DELAY = 100;
     const CONNECTION_NOTICE_DELAY = 30000;
     const APPROVAL_NOTICE_DELAY = 45000;
     const PLAYBACK_RETRY_DELAY = 30000;
+    const REMOTE_TRACK_EVENT_SUPPRESSION = 1000;
+    const REMOTE_CONTROL_EVENT_SUPPRESSION = 500;
+    const LOCAL_TRACK_EVENT_SUPPRESSION = 500;
     const SESSION_ID_PATTERN = /^[A-Za-z0-9_-]{22}$/;
     const CONTROL_PAYLOAD_NORMALIZERS = Object.freeze({
         play: () => ({}),
@@ -58,6 +62,7 @@
     let suppressGuestPlaybackUntil = 0;
     const sessionTracker = createSessionTracker();
     const noticeTimers = createTimerRegistry();
+    const pendingHostControls = new Set();
     let lastRemoteControlAt = 0;
     let activeSessionId = null;
     let blockedPlaybackUri = null;
@@ -313,15 +318,20 @@
         };
     }
 
+    function suppressGuestPlaybackEvents(duration) {
+        suppressGuestPlaybackUntil = Math.max(
+            suppressGuestPlaybackUntil,
+            performance.now() + duration
+        );
+    }
+
     async function applyState(state) {
         if (!state) return;
         if (applyingState) {
             pendingState = state;
             return;
         }
-
         applyingState = true;
-        suppressGuestPlaybackUntil = performance.now() + 1000;
         const activeVersion = sessionTracker.value();
         try {
             const p = Spicetify.Player;
@@ -329,6 +339,7 @@
 
             if (state.uri === blockedPlaybackUri && Date.now() < blockedPlaybackUntil) return;
             if (state.uri && p.data?.item?.uri !== state.uri) {
+                suppressGuestPlaybackEvents(REMOTE_TRACK_EVENT_SUPPRESSION);
                 await p.playUri(state.uri);
                 blockedPlaybackUri = null;
                 blockedPlaybackUntil = 0;
@@ -341,11 +352,14 @@
             // seconds apart, which is worse than the small direct-channel delay.
             const targetPosition = state.pos;
             if (Math.abs(p.getProgress() - targetPosition) > DRIFT_THRESHOLD) {
+                suppressGuestPlaybackEvents(REMOTE_CONTROL_EVENT_SUPPRESSION);
                 p.seek(targetPosition);
             }
 
-            if (state.playing && !p.isPlaying()) p.play();
-            else if (!state.playing && p.isPlaying()) p.pause();
+            if (state.playing !== p.isPlaying()) {
+                suppressGuestPlaybackEvents(REMOTE_CONTROL_EVENT_SUPPRESSION);
+                p[state.playing ? 'play' : 'pause']();
+            }
 
             updateNowPlaying(state);
         } catch (error) {
@@ -380,7 +394,7 @@
     function startHeartbeat() {
         stopHeartbeat();
         heartbeatInterval = setInterval(() => {
-            if (isHost) broadcastState();
+            if (isHost && guestApproved && pendingHostControls.size === 0) broadcastState();
         }, HEARTBEAT_INTERVAL);
     }
 
@@ -817,7 +831,7 @@
         const state = getPlayerState();
         if (!canRequestNativePlayback() || !state?.uri) return;
         sendData({ type: 'control', action: 'play-uri', uri: state.uri });
-        suppressGuestPlaybackUntil = performance.now() + 500;
+        suppressGuestPlaybackEvents(LOCAL_TRACK_EVENT_SUPPRESSION);
         showToast('Requested track from host', 'info');
     }
 
@@ -866,7 +880,10 @@
     function reportIceServerError(event) {
         if (event.errorCode !== 701) return;
         console.warn('SpotifyP2P: ICE server unreachable', event.url, event.errorText);
-        showToast('Your network cannot reach the connection helper server', 'error');
+    }
+
+    function hasIceCandidate(peerConnection) {
+        return /(?:^|\r?\n)a=candidate:/.test(peerConnection?.localDescription?.sdp || '');
     }
 
     function prepareGuestReconnect() {
@@ -937,6 +954,7 @@
         hostPC = null;
         guestPC = null;
         lastRemoteControlAt = 0;
+        pendingHostControls.clear();
         noticeTimers.clearAll();
         try { activeChannel?.close(); } catch (error) {}
         closePeerConnection(activeHostPC);
@@ -985,9 +1003,9 @@
             } else if (state === 'disconnected' || state === 'failed') {
                 if (state === 'disconnected') setConnectionState('reconnecting');
                 handleConnectionLoss(currentHostPC, () => {
-                setConnectionState('disconnected');
-                document.getElementById('p2p-host-session').classList.add('hidden');
-                showToast('Direct connection failed — generate a new code to reconnect', 'error');
+                    setConnectionState('disconnected');
+                    document.getElementById('p2p-host-session').classList.add('hidden');
+                    showToast('Direct connection failed — generate a new code to reconnect', 'error');
                 });
             } else if (state === 'connecting') {
                 setConnectionState('connecting');
@@ -1010,7 +1028,9 @@
         setConnectionState('connecting');
         const iceComplete = await waitForIceGatheringComplete(currentHostPC);
         if (!sessionTracker.isCurrent(activeVersion) || hostPC !== currentHostPC) return;
-        if (!iceComplete) showToast('Connection discovery timed out; this code may not work', 'warning');
+        if (!iceComplete && !hasIceCandidate(currentHostPC)) {
+            showToast('Connection discovery found no usable network route', 'warning');
+        }
         await updateHostOffer();
     }
 
@@ -1139,7 +1159,9 @@
 
             const iceComplete = await waitForIceGatheringComplete(currentGuestPC);
             if (!sessionTracker.isCurrent(activeVersion) || guestPC !== currentGuestPC) return;
-            if (!iceComplete) showToast('Connection discovery timed out; this response may not work', 'warning');
+            if (!iceComplete && !hasIceCandidate(currentGuestPC)) {
+                showToast('Connection discovery found no usable network route', 'warning');
+            }
 
             const encoded = await encode(createSignalEnvelope(currentGuestPC.localDescription, activeSessionId));
             answerEl.textContent = encoded;
@@ -1262,8 +1284,16 @@
     });
 
     async function applyHostControl(data) {
-        await HOST_CONTROL_HANDLERS[data.action](data);
-        setTimeout(broadcastState, 100);
+        const activeVersion = sessionTracker.value();
+        const pendingControl = {};
+        pendingHostControls.add(pendingControl);
+        try {
+            await HOST_CONTROL_HANDLERS[data.action](data);
+            if (!sessionTracker.isCurrent(activeVersion) || !isHost || !guestApproved) return;
+            noticeTimers.schedule('control-sync', HOST_CONTROL_SYNC_DELAY, broadcastState);
+        } finally {
+            pendingHostControls.delete(pendingControl);
+        }
     }
 
     const HOST_MESSAGE_HANDLERS = Object.freeze({
@@ -1462,6 +1492,7 @@
             decode,
             encode,
             getSignalErrorMessage,
+            hasIceCandidate,
             isFinitePosition,
             isPlayableSpotifyUri,
             normalizeProfile,
