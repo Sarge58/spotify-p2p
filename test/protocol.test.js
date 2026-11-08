@@ -12,6 +12,7 @@ const {
     createSignalEnvelope,
     decode,
     encode,
+    hasIceCandidate,
     normalizeProfile,
     parseSignalEnvelope,
     validateControlMessage,
@@ -116,6 +117,15 @@ test('compressed signaling cannot expand past the decoded size limit', async (co
     await assert.rejects(decode(code), /too large/);
 });
 
+test('connection diagnostics require a gathered ICE candidate', () => {
+    assert.equal(hasIceCandidate({ localDescription: { sdp: 'v=0\r\na=ice-ufrag:test\r\n' } }), false);
+    assert.equal(hasIceCandidate({
+        localDescription: {
+            sdp: 'v=0\r\na=ice-ufrag:test\r\na=candidate:1 1 UDP 2122260223 192.0.2.1 5000 typ host\r\n'
+        }
+    }), true);
+});
+
 test('valid playback state is normalized', () => {
     const state = validState();
     assert.deepEqual(validateSyncState(state), state);
@@ -134,8 +144,17 @@ test('control messages use an allowlist and validate seek positions', () => {
     assert.deepEqual(validateControlMessage({ action: 'seek', pos: 12345 }), {
         type: 'control', action: 'seek', pos: 12345
     });
+    assert.deepEqual(validateControlMessage({
+        action: 'play-uri',
+        uri: 'spotify:track:0BxE4FqsDD1Ot4YuBXwAPp'
+    }), {
+        type: 'control',
+        action: 'play-uri',
+        uri: 'spotify:track:0BxE4FqsDD1Ot4YuBXwAPp'
+    });
     assert.equal(validateControlMessage({ action: 'volume', level: 1 }), null);
     assert.equal(validateControlMessage({ action: 'seek', pos: Infinity }), null);
+    assert.equal(validateControlMessage({ action: 'play-uri', uri: 'https://example.com/audio' }), null);
 });
 
 test('messages are restricted by recipient role', () => {
